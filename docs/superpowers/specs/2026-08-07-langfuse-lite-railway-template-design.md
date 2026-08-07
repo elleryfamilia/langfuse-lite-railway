@@ -33,21 +33,34 @@ projects) where cost matters more than high availability.
 1. **Service count:** ~3 services using upstream images with a thin wrapper —
    not a 1-container all-in-one (too much image maintenance), not 2 services
    (combined data container has the same maintenance problem).
-2. **Image distribution:** prebuilt wrapper image pushed to GHCR
-   (`ghcr.io/elleryfamilia/langfuse-lite`), pinned to exact upstream Langfuse
-   versions. Not built-from-repo at deploy time.
+2. **Image distribution:** the real wrapper image is prebuilt and pushed to
+   GHCR (`ghcr.io/elleryfamilia/langfuse-lite`), pinned to exact upstream
+   Langfuse versions. Template services, however, deploy **from the GitHub
+   repo** via one-line Dockerfiles (`FROM ghcr.io/…:vX.Y.Z`) — because
+   Railway's template-update notifications only work for repo-based services;
+   image-based template services can never be updated without hand-editing
+   the template (docs: /templates/updates).
 3. **Upgrade policy:** scheduled CI checks upstream releases and opens bump
-   PRs; merging builds, smoke-tests, and publishes the new tag. No unreviewed
-   auto-publishing.
+   PRs; PR CI builds, smoke-tests, and pushes the exact-version GHCR tag
+   *before* merge (avoids a merge-then-image-missing race). Merging to `main`
+   flips the repo pin, which makes new deploys use the new version and
+   triggers Railway's "update available" notification for existing
+   deployers. No unreviewed auto-publishing; no manual template edits.
 4. **S3 layer:** Railway bucket first; if the template composer cannot include
    buckets, ship MinIO as a 4th service and swap to a bucket when supported.
+5. **Naming:** the template is named **"Langfuse Lite"** with no version in
+   the name. Version-pegged template names (common on the marketplace) go
+   stale because nothing updates them. Current version is stated in the
+   README/overview, which the bump PR also updates.
 
 ## Runtime architecture
 
 ### Service 1: `Langfuse` (app)
 
 - Image: `ghcr.io/elleryfamilia/langfuse-lite:<upstream-version>`. Initial pin:
-  **v4.6.0** (latest upstream release as of 2026-08-07).
+  **v4.6.0** (latest upstream release as of 2026-08-07). The template service
+  builds from `services/langfuse/` in this repo, whose Dockerfile is a single
+  `FROM` of that image (see Repo layout / CI for why).
 - One container, three processes under a lightweight supervisor:
   - **Langfuse web** — upstream `langfuse/langfuse` base. Serves UI + API on
     port 3000. Public Railway domain attached. Healthcheck:
@@ -118,28 +131,46 @@ credentials anywhere; everything generated per-deploy.
 
 ```
 langfuse-lite-railway/
-├── Dockerfile              # multi-stage: worker + redis + supervisor into web image
-├── supervisor/             # supervisor config + entrypoint script
+├── image/
+│   ├── Dockerfile          # the real image: worker + redis + supervisor into web image
+│   └── supervisor/         # supervisor config + entrypoint script
+├── services/               # what the template's services actually deploy
+│   ├── langfuse/Dockerfile   # FROM ghcr.io/elleryfamilia/langfuse-lite:v4.6.0
+│   ├── clickhouse/Dockerfile # FROM clickhouse/clickhouse-server:25.12
+│   └── postgres/Dockerfile   # FROM postgres:17
 ├── compose.smoke.yml       # local/CI stack: app image, postgres, clickhouse, minio
 ├── scripts/smoke-test.sh   # end-to-end assertions (see Validation)
 ├── .github/workflows/
-│   ├── build.yml           # PR: build + smoke test; main/tag: push to GHCR
+│   ├── build.yml           # PR: build image, smoke test, push exact GHCR tag
 │   └── bump.yml            # scheduled upstream release check → bump PR
 ├── README.md               # template overview in Railway's required format
 └── docs/superpowers/specs/ # this document
 ```
 
-Single source of truth for the pinned version: `ARG LANGFUSE_VERSION` in the
-Dockerfile. Image tags mirror upstream tags exactly.
+Each template service points at this repo with a root directory under
+`services/` (Railway's documented monorepo pattern), so **all three services**
+are repo-based and receive update notifications — including future ClickHouse
+or Postgres pin bumps, not just Langfuse releases. Deploy-time builds are
+trivial (each Dockerfile is a `FROM` line; the build is effectively an image
+pull).
+
+Single source of truth for the pinned version: `ARG LANGFUSE_VERSION` in
+`image/Dockerfile`; the bump PR keeps `services/langfuse/Dockerfile` in sync.
+GHCR tags mirror upstream tags exactly.
 
 ## CI
 
-- **build.yml** — on PR: build the wrapper image, run the smoke test. On merge
-  to main / version tag: additionally push to GHCR (public package).
+- **build.yml** — on PR: build the wrapper image, run the smoke test, and (for
+  same-repo branches) push the exact-version tag to GHCR so it exists before
+  the merge that references it. On main: verify the referenced tag exists.
 - **bump.yml** — scheduled (daily): compare `LANGFUSE_VERSION` against the
-  latest upstream GitHub release; if newer, edit the pin and open a PR. The PR
-  runs build.yml, so a failing bump never publishes.
+  latest upstream GitHub release; if newer, edit both Dockerfile pins (and the
+  ClickHouse pin if upstream's compose moved it), update the version line in
+  README, open a PR. The PR runs build.yml, so a failing bump never ships.
 - GHCR auth via the repo's built-in `GITHUB_TOKEN`; no extra secrets.
+- Merge to `main` is the single publishing action: new template deploys build
+  from main immediately, and existing deployers get Railway's opt-in "update
+  available" notification.
 
 ## Validation
 
@@ -159,17 +190,19 @@ for the project; template-composer publishing is the one manual step.
 ## Publishing
 
 - Compose the template in Railway's dashboard template editor: 3 services from
-  Docker images, volumes on Postgres/ClickHouse, env wiring per the table
-  above, bucket if supported (this is where the bucket question gets answered
-  empirically; MinIO fallback otherwise).
+  the GitHub repo (root directories `services/langfuse`, `services/clickhouse`,
+  `services/postgres`), volumes on Postgres/ClickHouse, env wiring per the
+  table above, bucket if supported (this is where the bucket question gets
+  answered empirically; MinIO fallback otherwise).
 - Name: **Langfuse Lite**. Proper 1:1 icons. Overview follows Railway's
   required H1/H2 structure ("Deploy and Host Langfuse Lite on Railway", use
   cases, dependencies, why Railway).
 - Publish to marketplace under Ellery's workspace (not Langfuse branding —
   Railway requires honest affiliation; the template name and overview must not
   imply official Langfuse endorsement).
-- Template updates after a bump merge: update the image tag in the template
-  composer (manual, ~1 minute; noted in the bump PR checklist).
+- No post-merge template maintenance: repo-based services make merges to
+  `main` the update mechanism (see CI section). The composer is only touched
+  for structural changes (new services, env contract changes).
 
 ## Assumptions
 

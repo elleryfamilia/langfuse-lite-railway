@@ -26,12 +26,19 @@ done
 
 TRACE_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-INGEST_RESPONSE=$(curl -s -u "$PK:$SK" -H 'Content-Type: application/json' \
+INGEST_RAW=$(curl -s -u "$PK:$SK" -H 'Content-Type: application/json' \
   -X POST http://localhost:3000/api/public/ingestion \
-  -d "{\"batch\":[{\"id\":\"evt-$TRACE_ID\",\"type\":\"trace-create\",\"timestamp\":\"$NOW\",\"body\":{\"id\":\"$TRACE_ID\",\"name\":\"smoke-trace\"}}]}")
-echo "ingestion response: $INGEST_RESPONSE"
+  -d "{\"batch\":[{\"id\":\"evt-$TRACE_ID\",\"type\":\"trace-create\",\"timestamp\":\"$NOW\",\"body\":{\"id\":\"$TRACE_ID\",\"name\":\"smoke-trace\"}}]}" \
+  -w '\n%{http_code}') || fail "ingestion request failed"
+INGEST_HTTP=$(echo "$INGEST_RAW" | tail -n1)
+INGEST_RESPONSE=$(echo "$INGEST_RAW" | sed '$d')
+echo "ingestion response (HTTP $INGEST_HTTP): $INGEST_RESPONSE"
+case "$INGEST_HTTP" in
+  2??) ;;
+  *) fail "ingestion API returned HTTP $INGEST_HTTP: $INGEST_RESPONSE (401 means LANGFUSE_INIT_* bootstrap did not run)" ;;
+esac
 echo "$INGEST_RESPONSE" | python3 -c 'import json,sys; r=json.load(sys.stdin); errs=r.get("errors",[]); sys.exit(1 if errs else 0)' \
-  || fail "ingestion API returned per-event errors (401 means LANGFUSE_INIT_* bootstrap did not run)"
+  || fail "ingestion API returned HTTP $INGEST_HTTP with per-event errors: $INGEST_RESPONSE"
 
 echo "waiting for trace to be queryable (web -> redis -> worker -> s3 -> clickhouse)..."
 ok=""
@@ -41,9 +48,9 @@ for _ in $(seq 1 90); do
 done
 [ -n "$ok" ] || fail "trace never became queryable"
 
-PGTZ_ACTUAL=$("${COMPOSE[@]}" exec -T postgres psql -U postgres -d langfuse -tAc "show timezone")
+PGTZ_ACTUAL=$("${COMPOSE[@]}" exec -T postgres psql -U postgres -d langfuse -tAc "show timezone") || fail "could not query postgres timezone"
 echo "$PGTZ_ACTUAL" | grep -qiE '^(Etc/)?(UTC|GMT)$' || fail "postgres timezone is '$PGTZ_ACTUAL', not UTC"
-CHTZ_ACTUAL=$("${COMPOSE[@]}" exec -T clickhouse clickhouse-client --user clickhouse --password clickhouse --query "SELECT timezone()")
+CHTZ_ACTUAL=$("${COMPOSE[@]}" exec -T clickhouse clickhouse-client --user clickhouse --password clickhouse --query "SELECT timezone()") || fail "could not query clickhouse timezone"
 echo "$CHTZ_ACTUAL" | grep -qiE '^(Etc/)?(UTC|GMT)$' || fail "clickhouse timezone is '$CHTZ_ACTUAL', not UTC"
 
 echo "SMOKE PASS"

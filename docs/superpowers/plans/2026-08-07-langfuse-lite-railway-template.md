@@ -10,6 +10,22 @@
 
 **Revision note:** This plan was revised after a two-reviewer gate (independent critic subagent + cross-model Opus review). Both proved the original bump-CI trigger mechanism unworkable and the UTC assertion wrong; the critic additionally caught a web/worker port collision. All accepted findings are folded in below.
 
+**Ingestion-mode decision (user, 2026-08-07):** Langfuse v4 defaults
+`LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`, which **rejects the legacy
+`trace-create` batch event** on `/api/public/ingestion` (that endpoint now
+accepts only `score-create` and `sdk-log`). The template ships **v4-native**:
+keep the upstream default, set no migration ENV overrides, and require modern
+SDKs (Python ≥4.7.0 / JS ≥5.4.0). Consequences that override earlier text in
+this plan wherever they conflict:
+- The smoke test ingests via OTLP: `POST /api/public/otel/v1/traces`, with
+  header `x-langfuse-ingestion-version: 4`, basic auth `pk:sk`, OTLP/JSON body.
+  Verified present in the image at
+  `/app/web/.next/server/pages/api/public/otel/v1/traces.js`.
+- The OTLP trace id (32 hex chars) is the id to poll on
+  `GET /api/public/traces/<id>`.
+- `image/Dockerfile` carries **no** `LANGFUSE_MIGRATION_V4_*` ENV lines.
+- README states the minimum SDK versions.
+
 ## Global Constraints
 
 - Never commit or push to `main` directly — all work on the existing branch `design/langfuse-lite-template`, integrated via PR. (One sanctioned exception: Task 5 bootstraps `main` from the reviewed branch because the repo has no `main` yet.)
@@ -472,6 +488,9 @@ Sign-up is open on a fresh instance — the first person to register owns it.
 ## Dependencies for Langfuse Lite Hosting
 
 - Langfuse web + worker (upstream images, combined; version pinned in `image/Dockerfile`)
+  — runs v4-native ingestion, so instrument with Python SDK ≥4.7.0 / JS ≥5.4.0
+  (or native OpenTelemetry); older SDKs are rejected by upstream's default
+  `events_only` write mode
 - PostgreSQL (Railway postgres-ssl; pinned in `services/postgres/Dockerfile`)
 - ClickHouse single node (pinned in `services/clickhouse/Dockerfile`)
 - Redis (embedded, ephemeral)

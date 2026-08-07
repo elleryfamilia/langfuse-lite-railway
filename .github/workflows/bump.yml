@@ -30,9 +30,19 @@ jobs:
           [ "$LATEST" = "$CURRENT" ] && { echo "already at $CURRENT"; exit 0; }
           [ "$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)" = "$LATEST" ] || { echo "latest ($LATEST) is older than pin ($CURRENT); skipping"; exit 0; }
 
-          # Idempotency: a bump branch for this version already exists
+          # Idempotency: skip only if a PR (any state) already exists for this version.
+          # Checking for the branch alone would conflate "branch exists" with "already
+          # handled" — if a prior run pushed the branch but then failed before opening
+          # the PR (transient API error, rate limit), every later run would find the
+          # branch, skip, and exit green forever with no PR ever created.
+          PR_COUNT=$(gh pr list --head "bump/langfuse-$LATEST" --state all --json number --jq 'length')
+          [ "$PR_COUNT" -gt 0 ] && { echo "bump/langfuse-$LATEST already has a PR; skipping"; exit 0; }
+
+          # Recovery: branch exists but no PR means a prior run pushed and then failed
+          # before opening the PR. Delete the stray branch so the checkout below is a
+          # clean retry through the normal path, rather than a special-cased one.
           git ls-remote --exit-code --heads origin "bump/langfuse-$LATEST" >/dev/null 2>&1 \
-            && { echo "bump/langfuse-$LATEST already open"; exit 0; }
+            && { echo "bump/langfuse-$LATEST exists with no PR (stuck from a prior failed run); deleting and retrying"; git push origin --delete "bump/langfuse-$LATEST"; }
 
           git checkout -b "bump/langfuse-$LATEST"
           sed -i "s/^ARG LANGFUSE_VERSION=.*/ARG LANGFUSE_VERSION=$LATEST/" image/Dockerfile

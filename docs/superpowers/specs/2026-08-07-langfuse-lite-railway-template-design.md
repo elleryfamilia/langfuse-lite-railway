@@ -259,3 +259,33 @@ for the project; template-composer publishing is the one manual step.
 Write the `Dockerfile` + supervisor config and get the combined
 web+worker+Redis container running locally against `compose.smoke.yml` — this
 de-risks the wrapper-image assumption before any CI or template work.
+
+## Outcome (2026-08-07)
+
+Built, tested, and verified end-to-end on live Railway infrastructure. What the
+implementation proved or corrected about this design:
+
+- **The core bet works.** One container running Langfuse web + worker + a
+  localhost Redis deploys and serves correctly. On Railway, a trace sent to the
+  OTLP endpoint was queryable 4 seconds later, having traversed
+  web -> redis -> worker -> Railway bucket -> ClickHouse.
+- **Buckets are supported in templates**, and Railway buckets work as Langfuse's
+  S3 backend. The MinIO fallback was never needed.
+- **A bucket must be deployed before its credentials exist.** Referencing an
+  undeployed bucket yields empty strings, not an error. The
+  `${{<bucket>.BUCKET}}` reference syntax itself is correct.
+- **Bucket endpoint is `https://t3.storageapi.dev`, region `iad`** — not the
+  `storage.railway.app` the Railway docs describe.
+- **Ingestion mode was a real product decision** (owner ruling): the template
+  ships Langfuse v4's upstream default `events_only`, so users need Python SDK
+  >= 4.7.0 / JS >= 5.4.0 or native OpenTelemetry. The legacy batch ingestion
+  endpoint rejects older SDKs with an explicit per-event error.
+- **`GET /api/public/traces/<id>` is unavailable in events_only mode**; reads go
+  through `GET /api/public/v2/observations`.
+- **The ClickHouse threat model in this spec was wrong.** The official entrypoint
+  removes the passwordless `default` user outright when `CLICKHOUSE_USER` is set;
+  the lockdown file is defense-in-depth and must merge first (`00-` prefix) or
+  ClickHouse crash-loops.
+- **The template composer strips literal variable values** while preserving
+  `${{...}}` references, so composing a template is not purely mechanical — see
+  `docs/TEMPLATE-SETUP.md`.

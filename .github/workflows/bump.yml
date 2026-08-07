@@ -1,0 +1,59 @@
+name: bump
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    if: github.repository == 'elleryfamilia/langfuse-lite-railway'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned vs latest upstream, open gated bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh api repos/langfuse/langfuse/releases/latest --jq .tag_name | sed 's/^v//')
+          CURRENT=$(sed -n 's/^ARG LANGFUSE_VERSION=//p' image/Dockerfile)
+
+          # Guards: non-empty, strict semver, strictly newer than current
+          echo "$LATEST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "no valid latest release ('$LATEST'); skipping"; exit 0; }
+          [ "$LATEST" = "$CURRENT" ] && { echo "already at $CURRENT"; exit 0; }
+          [ "$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)" = "$LATEST" ] || { echo "latest ($LATEST) is older than pin ($CURRENT); skipping"; exit 0; }
+
+          # Idempotency: a bump branch for this version already exists
+          git ls-remote --exit-code --heads origin "bump/langfuse-$LATEST" >/dev/null 2>&1 \
+            && { echo "bump/langfuse-$LATEST already open"; exit 0; }
+
+          git checkout -b "bump/langfuse-$LATEST"
+          sed -i "s/^ARG LANGFUSE_VERSION=.*/ARG LANGFUSE_VERSION=$LATEST/" image/Dockerfile
+          sed -i "s#^FROM ghcr.io/elleryfamilia/langfuse-lite:.*#FROM ghcr.io/elleryfamilia/langfuse-lite:$LATEST#" services/langfuse/Dockerfile
+          sed -i "s/^Current Langfuse version: .*/Current Langfuse version: $LATEST/" README.md
+
+          # Track upstream's ClickHouse pin only if the tag verifiably exists
+          CH=$(curl -sf "https://raw.githubusercontent.com/langfuse/langfuse/v$LATEST/docker-compose.yml" \
+            | sed -n 's/.*clickhouse-server:\([0-9][0-9.]*\).*/\1/p' | head -1) || CH=""
+          if [ -n "$CH" ] && docker manifest inspect "clickhouse/clickhouse-server:$CH" >/dev/null 2>&1; then
+            sed -i "s#^FROM clickhouse/clickhouse-server:.*#FROM clickhouse/clickhouse-server:$CH#" services/clickhouse/Dockerfile
+          fi
+
+          git config user.name "langfuse-lite-bot"
+          git config user.email "55049+elleryfamilia@users.noreply.github.com"
+          git commit -am "feat: bump Langfuse to $LATEST"
+          git push -u origin "bump/langfuse-$LATEST"
+
+          # GITHUB_TOKEN pushes trigger nothing; workflow_dispatch is the documented exception.
+          gh workflow run build.yml --ref "bump/langfuse-$LATEST" -f publish=true
+
+          gh pr create --base main \
+            --title "feat: bump Langfuse to $LATEST" \
+            --body "Automated upstream bump. A dispatched build run on this branch builds, smoke-tests, and publishes \`$LATEST\` to GHCR — merge only when that run is green. (This PR's own pull_request check may sit in 'approval-required'; the dispatched run on the head SHA is the gate.)"

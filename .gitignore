@@ -4,3 +4,8 @@
 .loadout/local.toml
 .cursor/rules/loadout.mdc
 .cursor/skills/loadout/
+.DS_Store
+*.log
+.env
+.env.*
+*.pem

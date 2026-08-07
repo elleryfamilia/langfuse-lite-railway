@@ -81,10 +81,16 @@ projects) where cost matters more than high availability.
 
 ### Service 2: `Postgres`
 
-- Upstream `postgres:17` (matches upstream compose default).
-- Volume at the Postgres data dir. Must run UTC (Postgres default; verified in
+- Base: `ghcr.io/railwayapp-templates/postgres-ssl:17` — the image Railway's
+  own "Add Postgres" deploys. Gets SSL, correct volume/`PGDATA`-subdirectory
+  handling (plain `postgres:17` can fail to init on a Railway volume because
+  the mount point isn't empty), and Railway-conventional behavior for free.
+- Volume at `/var/lib/postgresql/data` with `PGDATA` pointing at its `pgdata`
+  subdirectory (postgres-ssl convention). Must run UTC (default; verified in
   smoke test since Langfuse requires UTC).
-- `POSTGRES_PASSWORD` via `${{secret()}}`.
+- Standard Railway variable set replicated in the template: `POSTGRES_USER`,
+  `POSTGRES_PASSWORD` (via `${{secret()}}`), `POSTGRES_DB`, `PGHOST`/`PGPORT`
+  on the private domain, and `DATABASE_URL` for other services to reference.
 
 ### Service 3: `ClickHouse`
 
@@ -121,6 +127,12 @@ projects) where cost matters more than high availability.
 All service-to-service traffic uses Railway private networking. No default
 credentials anywhere; everything generated per-deploy.
 
+**Zero required user input:** every variable is either generated
+(`${{secret()}}`) or wired via reference variables, so deploying is a single
+click. The first human step is account signup in the Langfuse UI. Optional
+extras (e.g., SMTP for email invites) may be added later as clearly-labeled
+optional variables, never required ones.
+
 ### Explicit non-goals
 
 - High availability, horizontal scaling, ClickHouse clustering, Redis
@@ -137,7 +149,7 @@ langfuse-lite-railway/
 ├── services/               # what the template's services actually deploy
 │   ├── langfuse/Dockerfile   # FROM ghcr.io/elleryfamilia/langfuse-lite:v4.6.0
 │   ├── clickhouse/Dockerfile # FROM clickhouse/clickhouse-server:25.12
-│   └── postgres/Dockerfile   # FROM postgres:17
+│   └── postgres/Dockerfile   # FROM ghcr.io/railwayapp-templates/postgres-ssl:17
 ├── compose.smoke.yml       # local/CI stack: app image, postgres, clickhouse, minio
 ├── scripts/smoke-test.sh   # end-to-end assertions (see Validation)
 ├── .github/workflows/

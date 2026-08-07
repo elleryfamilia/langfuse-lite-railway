@@ -1,0 +1,77 @@
+services:
+  app:
+    image: "${IMAGE_TAG:-langfuse-lite:dev}"
+    build: ./image
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio: { condition: service_started }
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/langfuse
+      SALT: smokesalt
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      NEXTAUTH_SECRET: smokesecret
+      NEXTAUTH_URL: http://localhost:3000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: redis://127.0.0.1:6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_INIT_ORG_ID: smoke-org
+      LANGFUSE_INIT_PROJECT_ID: smoke-project
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-smoke-1234567890
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-smoke-1234567890
+      LANGFUSE_INIT_USER_EMAIL: smoke@example.com
+      LANGFUSE_INIT_USER_NAME: Smoke
+      LANGFUSE_INIT_USER_PASSWORD: smokePassw0rd!
+  postgres:
+    image: ghcr.io/railwayapp-templates/postgres-ssl:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    entrypoint: sh -c 'mkdir -p /data/langfuse && minio server /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+volumes:
+  pgdata:

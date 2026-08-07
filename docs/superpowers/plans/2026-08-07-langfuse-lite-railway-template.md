@@ -4,19 +4,46 @@
 
 **Goal:** Publish a Railway marketplace template ("Langfuse Lite") that deploys Langfuse v4.6.0 in 3 services + 1 bucket, with CI that auto-bumps upstream releases behind a gating smoke test.
 
-**Architecture:** A wrapper Docker image runs Langfuse web + worker + a localhost Redis in one container (worker gated on web health so migrations finish first). Template services deploy from one-line Dockerfiles in this repo (Railway update notifications only work for repo-based services). Postgres uses Railway's own postgres-ssl image; ClickHouse is single-node upstream; S3 is a Railway bucket (MinIO fallback if buckets can't ship in templates).
+**Architecture:** A wrapper Docker image runs Langfuse web + worker + a localhost Redis in one container (worker on internal port 3030, gated on web health so migrations finish first; launcher waits for Postgres/ClickHouse TCP readiness before starting anything). Template services deploy from one-line Dockerfiles in this repo (Railway update notifications only work for repo-based services). Postgres uses Railway's own postgres-ssl image; ClickHouse is single-node upstream with a locked-down `default` user; S3 is a Railway bucket (MinIO fallback if buckets can't ship in templates — resolved empirically in Task 0).
 
 **Tech Stack:** Docker (Alpine base), bash, docker compose, GitHub Actions, GHCR, Railway (MCP tools + dashboard template composer).
 
+**Revision note:** This plan was revised after a two-reviewer gate (independent critic subagent + cross-model Opus review). Both proved the original bump-CI trigger mechanism unworkable and the UTC assertion wrong; the critic additionally caught a web/worker port collision. All accepted findings are folded in below.
+
 ## Global Constraints
 
-- Never commit or push to `main` directly — all work on the existing branch `design/langfuse-lite-template`, integrated via PR.
+- Never commit or push to `main` directly — all work on the existing branch `design/langfuse-lite-template`, integrated via PR. (One sanctioned exception: Task 5 bootstraps `main` from the reviewed branch because the repo has no `main` yet.)
 - Repo git config already sets commit email `55049+elleryfamilia@users.noreply.github.com` (public repo; GitHub email privacy).
 - Pinned versions (single sources of truth, exact values today): `ARG LANGFUSE_VERSION=4.6.0` in `image/Dockerfile`; `clickhouse/clickhouse-server:25.12` in `services/clickhouse/Dockerfile`; `ghcr.io/railwayapp-templates/postgres-ssl:17` in `services/postgres/Dockerfile`.
-- Image name: `ghcr.io/elleryfamilia/langfuse-lite`. Tags mirror Docker Hub's Langfuse tags (no `v` prefix): `4.6.0`.
-- No secrets in the repo, ever. Smoke-test credentials are throwaway literals that only bind to localhost stacks.
-- Both upstream Langfuse images are Alpine, run as uid 1001 (`nextjs` / `expressjs`), workdir `/app`, PID1 `dumb-init` (verified 2026-08-07 via `docker inspect`).
+- Image name: `ghcr.io/elleryfamilia/langfuse-lite`. Tags mirror Docker Hub's Langfuse tags (no `v` prefix): `4.6.0`. Release tags are **create-only** — CI must never overwrite an existing version tag.
+- No secrets in the repo, ever; no extra CI secrets either (`GITHUB_TOKEN` only — the bump flow uses the `workflow_dispatch` exception, not a PAT). Smoke-test credentials are throwaway literals that only bind to localhost stacks.
+- Both upstream Langfuse images are Alpine (bash 5.x via apk), run as uid 1001, workdir `/app`, PID1 `dumb-init`. Verified 2026-08-07: web image `/app` has `node_modules/ packages/ web/ next.config.mjs package.json` and **no** `worker/`; worker image `/app` contains exactly `worker/` — the trees do not collide. Web ships `ENV PORT=3000`; worker ships `ENV PORT=3030` and its process binds `env.PORT` — in the merged image the worker MUST get `PORT=3030` explicitly or both bind 3000 and crash-loop.
 - The user runs macOS/arm64 locally; CI (ubuntu) publishes amd64 images. Local `docker build` of `services/langfuse` will emit a platform warning — expected, ignored.
+- GitHub Actions ground truth (verified against GitHub docs): pushes made with `GITHUB_TOKEN` do NOT trigger `push` workflows; PRs created with `GITHUB_TOKEN` create `pull_request` runs only in an approval-required state. The documented exceptions are `workflow_dispatch` and `repository_dispatch` — the bump flow relies on `workflow_dispatch`.
+
+---
+
+### Task 0: Bucket-in-template spike (10 minutes, answers the fork in the road)
+
+**Files:** none (Railway dashboard)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: a recorded yes/no — "can a Railway template contain a bucket?" README wording (Task 4), the app's S3 wiring (Tasks 9–10), and the marketplace copy all branch on this. Record the answer in `docs/superpowers/specs/2026-08-07-langfuse-lite-railway-template-design.md` (Risks table) immediately.
+
+- [ ] **Step 1: Open the template composer and try to add a bucket**
+
+In the Railway dashboard: workspace settings → Templates → New Template. Check the `Add New` menu (and the `CMD+K` palette) for a Bucket option alongside services/volumes.
+- Bucket option exists → add one, confirm it saves in the draft template, then discard the draft. **Outcome: BUCKET.**
+- No bucket option → discard the draft. **Outcome: MINIO** (template ships MinIO as a 4th service; the "3 services + bucket" copy in Task 4 becomes "4 services").
+
+- [ ] **Step 2: Record the outcome**
+
+Update the spec's Risks table row ("Buckets can't be included in published templates") with what was observed, and note the outcome at the top of Task 4 and Task 10 below (edit this plan file). Commit:
+
+```bash
+git add -A && git commit -m "docs: record bucket-in-template spike outcome"
+```
 
 ---
 
@@ -27,17 +54,22 @@
 - Create: `scripts/smoke-test.sh`
 
 **Interfaces:**
-- Consumes: nothing (first task).
-- Produces: `scripts/smoke-test.sh` — exit 0 on pass; honors env `IMAGE_TAG` (prebuilt app image name; when unset, compose builds `./image`). Compose project uses app service name `app`, exposes web on `localhost:3000`. Smoke API keys are the literals `pk-lf-smoke-1234567890` / `sk-lf-smoke-1234567890` (Task 6's CI and Task 8's cloud verify reuse the ingest/query pattern).
+- Consumes: nothing.
+- Produces: `scripts/smoke-test.sh` — exit 0 on pass; honors env `IMAGE_TAG` (prebuilt app image name; when unset, compose builds `./image`). App service name `app`, web on `localhost:3000`. Smoke API keys are the literals `pk-lf-smoke-1234567890` / `sk-lf-smoke-1234567890` (obviously fake, but verify GitHub push protection doesn't flag them at Task 5). Task 6's CI and Task 9's cloud verify reuse the ingest/query pattern.
 
 - [ ] **Step 1: Write `compose.smoke.yml`**
+
+Notes: `TZ`/`PGTZ` on Postgres match upstream Langfuse's own compose (without them postgres-ssl reports `Etc/UTC`). Healthchecks + `service_healthy` conditions mirror upstream — `depends_on` alone waits only for container start, and the app entrypoint migrates immediately. Postgres gets a named volume so the PGDATA-subdirectory path (the reason we chose postgres-ssl) is actually exercised. S3 prefixes are set so the smoke stack covers the same prefix handling the template uses.
 
 ```yaml
 services:
   app:
     image: "${IMAGE_TAG:-langfuse-lite:dev}"
     build: ./image
-    depends_on: [postgres, clickhouse, minio]
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio: { condition: service_started }
     ports: ["3000:3000"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/langfuse
@@ -52,12 +84,14 @@ services:
       CLICKHOUSE_CLUSTER_ENABLED: "false"
       REDIS_CONNECTION_STRING: redis://127.0.0.1:6379
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
       LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
       LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
       LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
       LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
       LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
       LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
       LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
       LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
@@ -77,21 +111,41 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: langfuse
       PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
   clickhouse:
     image: clickhouse/clickhouse-server:25.12
     environment:
       CLICKHOUSE_DB: default
       CLICKHOUSE_USER: clickhouse
       CLICKHOUSE_PASSWORD: clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
   minio:
     image: cgr.dev/chainguard/minio
     entrypoint: sh -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'
     environment:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: miniosecret
+volumes:
+  pgdata:
 ```
 
+(Note: `cgr.dev/chainguard/minio` publishes only a moving `:latest` on the free tier. At implementation, check whether `minio/minio` has a current `RELEASE.*` tag — `docker manifest inspect minio/minio:<tag>` — and pin that instead if so, adjusting the entrypoint to MinIO's standard `server /data` form. If pinning is impractical, keep chainguard and accept the drift; the harness still gates on behavior.)
+
 - [ ] **Step 2: Write `scripts/smoke-test.sh`**
+
+Notes: trace ID via python3 (uuidgen isn't guaranteed on ubuntu runners); UTC grep accepts `Etc/UTC`; ingestion response body is captured and asserted (a 207 with per-event errors would otherwise surface 3 minutes later as a misleading timeout); 600 s health budget (postgres-ssl initdb + SSL certs + pgbackrest init + both migration sets on a cold stack).
 
 ```bash
 #!/usr/bin/env bash
@@ -102,6 +156,7 @@ COMPOSE=(docker compose -f compose.smoke.yml)
 PK=pk-lf-smoke-1234567890
 SK=sk-lf-smoke-1234567890
 
+fail() { echo "FAIL: $1"; "${COMPOSE[@]}" logs app | tail -150; exit 1; }
 cleanup() { "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
@@ -111,21 +166,22 @@ else
   "${COMPOSE[@]}" up -d --build
 fi
 
-echo "waiting for app health..."
+echo "waiting for app health (up to 600s)..."
 ok=""
-for _ in $(seq 1 120); do
+for _ in $(seq 1 300); do
   if curl -sf http://localhost:3000/api/public/health >/dev/null; then ok=1; break; fi
   sleep 2
 done
-if [ -z "$ok" ]; then
-  echo "FAIL: health timeout"; "${COMPOSE[@]}" logs app | tail -150; exit 1
-fi
+[ -n "$ok" ] || fail "health timeout"
 
-TRACE_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+TRACE_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-curl -sf -u "$PK:$SK" -H 'Content-Type: application/json' \
+INGEST_RESPONSE=$(curl -s -u "$PK:$SK" -H 'Content-Type: application/json' \
   -X POST http://localhost:3000/api/public/ingestion \
-  -d "{\"batch\":[{\"id\":\"evt-$TRACE_ID\",\"type\":\"trace-create\",\"timestamp\":\"$NOW\",\"body\":{\"id\":\"$TRACE_ID\",\"name\":\"smoke-trace\"}}]}" >/dev/null
+  -d "{\"batch\":[{\"id\":\"evt-$TRACE_ID\",\"type\":\"trace-create\",\"timestamp\":\"$NOW\",\"body\":{\"id\":\"$TRACE_ID\",\"name\":\"smoke-trace\"}}]}")
+echo "ingestion response: $INGEST_RESPONSE"
+echo "$INGEST_RESPONSE" | python3 -c 'import json,sys; r=json.load(sys.stdin); errs=r.get("errors",[]); sys.exit(1 if errs else 0)' \
+  || fail "ingestion API returned per-event errors (401 means LANGFUSE_INIT_* bootstrap did not run)"
 
 echo "waiting for trace to be queryable (web -> redis -> worker -> s3 -> clickhouse)..."
 ok=""
@@ -133,15 +189,12 @@ for _ in $(seq 1 90); do
   if curl -sf -u "$PK:$SK" "http://localhost:3000/api/public/traces/$TRACE_ID" >/dev/null; then ok=1; break; fi
   sleep 2
 done
-if [ -z "$ok" ]; then
-  echo "FAIL: trace never became queryable"; "${COMPOSE[@]}" logs app | tail -150; exit 1
-fi
+[ -n "$ok" ] || fail "trace never became queryable"
 
-"${COMPOSE[@]}" exec -T postgres psql -U postgres -d langfuse -tAc "show timezone" | grep -qix utc \
-  || { echo "FAIL: postgres not UTC"; exit 1; }
-"${COMPOSE[@]}" exec -T clickhouse clickhouse-client --user clickhouse --password clickhouse \
-  --query "SELECT timezone()" | grep -qi utc \
-  || { echo "FAIL: clickhouse not UTC"; exit 1; }
+PGTZ_ACTUAL=$("${COMPOSE[@]}" exec -T postgres psql -U postgres -d langfuse -tAc "show timezone")
+echo "$PGTZ_ACTUAL" | grep -qiE '^(Etc/)?(UTC|GMT)$' || fail "postgres timezone is '$PGTZ_ACTUAL', not UTC"
+CHTZ_ACTUAL=$("${COMPOSE[@]}" exec -T clickhouse clickhouse-client --user clickhouse --password clickhouse --query "SELECT timezone()")
+echo "$CHTZ_ACTUAL" | grep -qiE '^(Etc/)?(UTC|GMT)$' || fail "clickhouse timezone is '$CHTZ_ACTUAL', not UTC"
 
 echo "SMOKE PASS"
 ```
@@ -169,39 +222,70 @@ git commit -m "test: add end-to-end smoke harness for the lite stack"
 
 **Interfaces:**
 - Consumes: smoke harness from Task 1.
-- Produces: buildable image context at `image/` with `ARG LANGFUSE_VERSION=4.6.0` on line 1 of `image/Dockerfile` (Tasks 6/7 sed this exact line). Container serves HTTP on port 3000; expects the env contract listed in `compose.smoke.yml`.
+- Produces: buildable image context at `image/` with `ARG LANGFUSE_VERSION=4.6.0` on line 1 of `image/Dockerfile` (Tasks 6/7 sed this exact line). Container serves HTTP on port 3000 (web); worker runs internally on 3030; expects the env contract listed in `compose.smoke.yml`.
 
 - [ ] **Step 1: Write `image/launcher.sh`**
 
-Process model: Redis starts immediately; web starts (its upstream entrypoint runs Postgres + ClickHouse migrations, then serves); worker waits for web health so it never races unfinished migrations. If any process exits, the launcher exits with its code so the platform restarts the container.
+Process model: wait for Postgres + ClickHouse TCP readiness (Railway deploys all services in parallel; a crash-before-ready burns the healthcheck window) → start Redis → start web (upstream entrypoint migrates then serves, bound to `::` so Railway's IPv6 private network and the loopback health gate both work) → start worker only after web is healthy, with its own `PORT=3030`. Any process exiting takes the container down (nonzero) so Railway restarts it; a graceful TERM exits 0.
 
 ```bash
 #!/bin/bash
 set -uo pipefail
 
-redis-server --port 6379 --bind 127.0.0.1 --save '' --appendonly no --dir /var/lib/redis-eph &
+# --- wait for backing stores (parse host:port from the URLs) ---
+wait_tcp() { # host port label
+  local i
+  for i in $(seq 1 150); do
+    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; echo "$3 reachable"; return 0; }
+    sleep 2
+  done
+  echo "FATAL: $3 ($1:$2) unreachable after 300s"; exit 1
+}
+if [[ "${DATABASE_URL:-}" =~ @([^:/?]+)(:([0-9]+))? ]]; then
+  wait_tcp "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-5432}" "postgres"
+fi
+if [[ "${CLICKHOUSE_URL:-}" =~ ^https?://([^:/?]+)(:([0-9]+))? ]]; then
+  wait_tcp "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-8123}" "clickhouse"
+fi
+
+TERMED=""
+shutdown() { TERMED=1; kill -TERM ${REDIS_PID:-} ${WORKER_PID:-} ${WEB_PID:-} 2>/dev/null || true; }
+trap shutdown TERM INT
+
+redis-server --port 6379 --bind 127.0.0.1 --save '' --appendonly no \
+  --maxmemory-policy noeviction --dir /var/lib/redis-eph &
 REDIS_PID=$!
 
+WEB_PORT="${PORT:-3000}"
 (
-  until wget -q --spider http://127.0.0.1:3000/api/public/health 2>/dev/null; do sleep 2; done
-  cd /worker && exec ./worker/entrypoint.sh node worker/dist/index.js
+  cd /app
+  export HOSTNAME=::   # bind IPv6 dual-stack: Railway private net is IPv6; loopback probe still works
+  exec ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000
 ) &
-WORKER_PID=$!
-
-(cd /app && exec ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000) &
 WEB_PID=$!
 
-shutdown() { kill -TERM "$REDIS_PID" "$WORKER_PID" "$WEB_PID" 2>/dev/null || true; }
-trap shutdown TERM INT
+(
+  until wget -q -O /dev/null "http://127.0.0.1:${WEB_PORT}/api/public/health" 2>/dev/null \
+     || wget -q -O /dev/null "http://[::1]:${WEB_PORT}/api/public/health" 2>/dev/null; do
+    sleep 2
+  done
+  cd /app
+  export PORT=3030   # worker binds env.PORT; without this it collides with web on 3000
+  exec ./worker/entrypoint.sh node worker/dist/index.js
+) &
+WORKER_PID=$!
 
 wait -n "$REDIS_PID" "$WORKER_PID" "$WEB_PID"
 CODE=$?
 shutdown
 wait
+[ -n "$TERMED" ] && exit 0
 exit $CODE
 ```
 
 - [ ] **Step 2: Write `image/Dockerfile`**
+
+The worker image's `/app` contains exactly one entry (`worker/`) and the web image's `/app` has no `worker/` — so the worker copies into `/app/worker` with zero collisions and zero path drift (its pnpm-deployed `node_modules` and generated Prisma client stay at the paths they were built for). Ownership `1001:1001` matches both images' uid/gid (web chowns its files `nextjs:nodejs`, gid 1001 — not `nogroup`). `CMD []` prevents the base image's inherited CMD being appended to the launcher.
 
 ```dockerfile
 ARG LANGFUSE_VERSION=4.6.0
@@ -211,24 +295,32 @@ FROM langfuse/langfuse:${LANGFUSE_VERSION}
 USER root
 RUN apk add --no-cache bash redis \
     && mkdir -p /var/lib/redis-eph \
-    && chown nextjs:nogroup /var/lib/redis-eph
-COPY --from=worker --chown=nextjs:nogroup /app /worker
-COPY --chown=nextjs:nogroup launcher.sh /launcher.sh
+    && chown 1001:1001 /var/lib/redis-eph
+COPY --from=worker --chown=1001:1001 /app/worker /app/worker
+COPY --chown=1001:1001 launcher.sh /launcher.sh
 RUN chmod +x /launcher.sh
 USER nextjs
 ENV PORT=3000
 EXPOSE 3000
 ENTRYPOINT ["dumb-init", "--", "/launcher.sh"]
+CMD []
 ```
 
-Notes for the implementer: `nextjs`(uid 1001) and `nogroup` exist in the web image; `dumb-init` is the upstream PID1; web listens on `$PORT` (default 3000). The worker copy lands at `/worker` so its relative paths (`./worker/entrypoint.sh`, `worker/dist/index.js`) work with `cd /worker`.
+- [ ] **Step 3: Verify the layout assumption before testing**
 
-- [ ] **Step 3: Run the smoke test**
+Run:
+```bash
+docker build -t langfuse-lite:dev image/
+docker run --rm --entrypoint sh langfuse-lite:dev -c 'ls -la /app | head; ls /app/worker | head; which bash redis-server'
+```
+Expected: `/app` shows both `web/` and `worker/`; bash and redis-server resolve.
+
+- [ ] **Step 4: Run the smoke test**
 
 Run: `./scripts/smoke-test.sh`
-Expected: `SMOKE PASS` (first run downloads images; allow ~5 minutes). If health times out, check `docker compose -f compose.smoke.yml logs app` — the most likely failures are migration errors (bad ClickHouse URL) or the worker starting before web (must not happen given the health gate).
+Expected: `SMOKE PASS` (first run downloads images; allow ~10 minutes). If it fails, read the `logs app` tail the script prints: migration errors mean DB connectivity/env; "unreachable after 300s" means the readiness gate itself — check compose healthchecks.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add image/
@@ -237,18 +329,20 @@ git commit -m "feat: combined web+worker+redis wrapper image passing smoke test"
 
 ---
 
-### Task 3: Template service Dockerfiles
+### Task 3: Template service Dockerfiles (+ ClickHouse lockdown)
 
 **Files:**
 - Create: `services/langfuse/Dockerfile`
 - Create: `services/clickhouse/Dockerfile`
+- Create: `services/clickhouse/lockdown.xml`
 - Create: `services/postgres/Dockerfile`
+- Modify: `compose.smoke.yml` (postgres/clickhouse services switch to building `services/*` for parity)
 
 **Interfaces:**
-- Consumes: the GHCR image name/tag contract from Global Constraints (image does not exist remotely yet — local verification tags a local build with that name).
-- Produces: the three root directories the Railway template's services point at (`services/langfuse`, `services/clickhouse`, `services/postgres`). Task 7's bump sed targets the `FROM` line of `services/langfuse/Dockerfile` and the tag in `services/clickhouse/Dockerfile`.
+- Consumes: the GHCR image name/tag contract from Global Constraints (image does not exist remotely yet — local verification tags a local build with that name, then removes the tag).
+- Produces: the three root directories the Railway template's services point at. Task 7's bump sed targets the `FROM` line of `services/langfuse/Dockerfile` and the tag in `services/clickhouse/Dockerfile`.
 
-- [ ] **Step 1: Write the three one-line Dockerfiles**
+- [ ] **Step 1: Write the Dockerfiles**
 
 `services/langfuse/Dockerfile`:
 ```dockerfile
@@ -258,6 +352,21 @@ FROM ghcr.io/elleryfamilia/langfuse-lite:4.6.0
 `services/clickhouse/Dockerfile`:
 ```dockerfile
 FROM clickhouse/clickhouse-server:25.12
+COPY lockdown.xml /etc/clickhouse-server/users.d/lockdown.xml
+```
+
+`services/clickhouse/lockdown.xml` — the official entrypoint creates `CLICKHOUSE_USER` but leaves the passwordless `default` user reachable; restrict it to loopback so it cannot be used across Railway's private network:
+```xml
+<clickhouse>
+  <users>
+    <default>
+      <networks replace="replace">
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>
 ```
 
 `services/postgres/Dockerfile`:
@@ -265,21 +374,34 @@ FROM clickhouse/clickhouse-server:25.12
 FROM ghcr.io/railwayapp-templates/postgres-ssl:17
 ```
 
-- [ ] **Step 2: Verify all three build**
+- [ ] **Step 2: Point the smoke stack at these build contexts (parity)**
+
+In `compose.smoke.yml`, replace the postgres/clickhouse `image:` lines:
+```yaml
+  postgres:
+    build: ./services/postgres
+    # (environment/volumes/healthcheck unchanged)
+  clickhouse:
+    build: ./services/clickhouse
+    # (environment/healthcheck unchanged)
+```
+
+- [ ] **Step 3: Verify builds and rerun the smoke test**
 
 Run:
 ```bash
-docker build -t langfuse-lite:dev image/
 docker tag langfuse-lite:dev ghcr.io/elleryfamilia/langfuse-lite:4.6.0
-docker build services/langfuse/ && docker build services/clickhouse/ && docker build services/postgres/
+docker build services/langfuse/
+docker rmi ghcr.io/elleryfamilia/langfuse-lite:4.6.0   # never leave a local arm64 build wearing the canonical tag
+./scripts/smoke-test.sh
 ```
-Expected: all three succeed (the langfuse one resolves the GHCR name from the local tag; clickhouse and postgres pull upstream).
+Expected: langfuse service builds from the local tag; smoke passes with the lockdown in place (the app connects as `clickhouse`, not `default`, so nothing changes functionally).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add services/
-git commit -m "feat: repo-based service Dockerfiles for Railway template"
+git add services/ compose.smoke.yml
+git commit -m "feat: repo-based service Dockerfiles with ClickHouse default-user lockdown"
 ```
 
 ---
@@ -290,12 +412,12 @@ git commit -m "feat: repo-based service Dockerfiles for Railway template"
 - Create: `README.md`
 
 **Interfaces:**
-- Consumes: decisions in `docs/superpowers/specs/2026-08-07-langfuse-lite-railway-template-design.md`.
-- Produces: the exact line `Current Langfuse version: 4.6.0` (Task 7's bump sed rewrites it); overview copy pasted into the Railway template at Task 9.
+- Consumes: Task 0's bucket outcome (adjust "3 services + a storage bucket" to "4 services" if MINIO); spec decisions.
+- Produces: the exact line `Current Langfuse version: 4.6.0` (Task 7's bump sed rewrites it — it is the ONLY versioned line; dependency bullets deliberately carry no version numbers so infra bumps can't stale them); overview copy pasted into the Railway template at Task 10.
 
 - [ ] **Step 1: Write `README.md`**
 
-Follow Railway's required overview structure. Content requirements (write full prose, not placeholders):
+Follow Railway's required overview structure. Content requirements (write full prose):
 
 ```markdown
 # Deploy and Host Langfuse Lite on Railway
@@ -314,12 +436,15 @@ Current Langfuse version: 4.6.0
 A full Langfuse v3/v4 self-host needs six components: web app, worker,
 Postgres, ClickHouse, Redis, and S3-compatible blob storage. Langfuse Lite
 keeps all six functions but co-locates web, worker, and Redis in a single
-container (worker waits for web so database migrations finish first; Redis
-is in-memory only). Postgres runs Railway's own postgres-ssl image with a
-volume; ClickHouse runs single-node with a volume; blob storage is a Railway
-bucket. Upgrades ship as pull requests in this repo — merging a version bump
-updates new deploys and notifies existing ones via Railway's template
-update flow.
+container (the worker waits for web so database migrations finish first;
+Redis is in-memory only). Postgres runs Railway's own postgres-ssl image
+with a volume; ClickHouse runs single-node with a volume; blob storage is a
+Railway bucket. Upgrades ship as pull requests in this repo — merging a
+version bump updates new deploys and notifies existing ones via Railway's
+template update flow.
+
+**After deploying: open the app URL and create your account immediately.**
+Sign-up is open on a fresh instance — the first person to register owns it.
 
 ## Common Use Cases
 
@@ -330,10 +455,10 @@ update flow.
 
 ## Dependencies for Langfuse Lite Hosting
 
-- Langfuse web + worker (upstream images, combined)
-- PostgreSQL 17 (Railway postgres-ssl)
-- ClickHouse 25.12 (single node)
-- Redis 7 (embedded, ephemeral)
+- Langfuse web + worker (upstream images, combined; version pinned in `image/Dockerfile`)
+- PostgreSQL (Railway postgres-ssl; pinned in `services/postgres/Dockerfile`)
+- ClickHouse single node (pinned in `services/clickhouse/Dockerfile`)
+- Redis (embedded, ephemeral)
 - Railway bucket (S3-compatible)
 
 ### Deployment Dependencies
@@ -345,8 +470,10 @@ update flow.
 ### Implementation Details
 
 **Not for production.** No HA, single-node ClickHouse, ephemeral Redis queue
-(a redeploy can drop queued-but-unprocessed events), no backups. For
-production use Langfuse Cloud or a full 6-service template.
+(a redeploy can drop queued-but-unprocessed events), no backups. Plan
+roughly 2 GB RAM for the app service. Infrastructure pins (ClickHouse,
+Postgres) are re-checked only when a Langfuse release bumps — they do not
+self-update. For production use Langfuse Cloud or a full 6-service template.
 
 ### Why Deploy Langfuse Lite on Railway?
 
@@ -356,9 +483,18 @@ while allowing you to vertically and horizontally scale it.
 
 By deploying Langfuse Lite on Railway, you get full LLM observability for
 your pre-production apps at the lowest service footprint available.
+
+## Development
+
+- `./scripts/smoke-test.sh` — full local end-to-end: builds the wrapper
+  image, boots Postgres + ClickHouse + MinIO, ingests a trace, and verifies
+  it becomes queryable.
+- A scheduled GitHub Action watches Langfuse releases and opens bump PRs;
+  CI builds, smoke-tests, and publishes the exact-version image before the
+  PR can merge. Merging is the release action.
 ```
 
-Also append a short "Development" section documenting the two commands: `./scripts/smoke-test.sh` (full local E2E) and how the bump automation works (scheduled action opens PR; merging publishes).
+(If Task 0's outcome was MINIO: change "3 services + a storage bucket" to "4 services", and the bucket bullet to "MinIO (S3-compatible, volume-backed)".)
 
 - [ ] **Step 2: Verify the version line matches the pin**
 
@@ -377,26 +513,31 @@ git commit -m "docs: template overview README in Railway marketplace format"
 ### Task 5: Publish repo to GitHub
 
 **Files:**
-- Create: `.gitignore` (entries: `.DS_Store`, `*.log`)
+- Create: `LICENSE` (MIT — Railway's kickback program targets open-source templates)
+- Modify: `.gitignore` (append — the working tree already ignores `.loadout/` and `.cursor/` entries; do NOT overwrite)
 
 **Interfaces:**
 - Consumes: all prior tasks committed on `design/langfuse-lite-template`.
-- Produces: public repo `elleryfamilia/langfuse-lite-railway` with `main` as default branch containing all work so far; later tasks (CI, Railway services) depend on it existing.
+- Produces: public repo `elleryfamilia/langfuse-lite-railway`, `main` bootstrapped, Actions allowed to create PRs. CI (Task 6) and Railway services (Task 9) depend on it.
 
-- [ ] **Step 1: Create `.gitignore`, commit**
+- [ ] **Step 1: LICENSE + .gitignore, commit**
 
 ```bash
-printf '.DS_Store\n*.log\n' > .gitignore
-git add .gitignore && git commit -m "chore: add gitignore"
+curl -sf https://raw.githubusercontent.com/licenses/license-templates/master/templates/mit.txt \
+  | sed "s/{{ year }}/2026/; s/{{ organization }}/Ellery Familia/" > LICENSE
+# fallback if that URL 404s: paste the standard MIT text with "Copyright (c) 2026 Ellery Familia"
+printf '.DS_Store\n*.log\n.env\n.env.*\n*.pem\n' >> .gitignore
+git add LICENSE .gitignore && git commit -m "chore: add MIT license and gitignore entries"
 ```
 
 - [ ] **Step 2: Create the public repo and push the branch**
 
 ```bash
-gh repo create elleryfamilia/langfuse-lite-railway --public --description "Langfuse Lite — minimal Langfuse deployment template for Railway (3 services + bucket)" --source . --push
-git push -u origin design/langfuse-lite-template
+gh repo create elleryfamilia/langfuse-lite-railway --public \
+  --description "Langfuse Lite — minimal Langfuse deployment template for Railway" \
+  --source . --push
 ```
-Note: `--source . --push` pushes the current branch. The repo will have no `main` yet; create it from the current branch state via PR merge in the next step.
+If push protection blocks on the smoke `pk-lf-`/`sk-lf-` literals, they are documented throwaway values — use the "allow" URL GitHub prints, or restructure the literals (e.g., build them in the script from parts) and re-commit.
 
 - [ ] **Step 3: Bootstrap `main`**
 
@@ -406,9 +547,16 @@ Rule: if `main` does not exist yet, creating it from the reviewed branch IS the 
 git push origin design/langfuse-lite-template:refs/heads/main
 gh repo edit elleryfamilia/langfuse-lite-railway --default-branch main
 ```
-Continue working on `design/langfuse-lite-template`.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 4: Allow Actions to create PRs (required for Task 7)**
+
+`pull-requests: write` in the workflow is necessary but not sufficient — this is a separate repo toggle:
+```bash
+gh api -X PUT repos/elleryfamilia/langfuse-lite-railway/actions/permissions/workflow \
+  -f default_workflow_permissions=write -F can_approve_pull_request_reviews=true
+```
+
+- [ ] **Step 5: Verify**
 
 Run: `gh repo view elleryfamilia/langfuse-lite-railway --json defaultBranchRef,visibility --jq '.defaultBranchRef.name + " " + .visibility'`
 Expected: `main PUBLIC`
@@ -422,7 +570,7 @@ Expected: `main PUBLIC`
 
 **Interfaces:**
 - Consumes: `scripts/smoke-test.sh` `IMAGE_TAG` contract (Task 1); `ARG LANGFUSE_VERSION` pin line (Task 2).
-- Produces: GHCR package `ghcr.io/elleryfamilia/langfuse-lite:<version>` published from same-repo branches/PRs; `main` verifies the tag exists. Triggers on `push` to `main` and `bump/**` (workflow-created PRs don't trigger `pull_request` workflows when opened with `GITHUB_TOKEN` — branch-push triggering sidesteps that GitHub limitation).
+- Produces: GHCR package `ghcr.io/elleryfamilia/langfuse-lite:<version>`. Publish paths: (a) `workflow_dispatch` with `publish=true` — used by the bump flow (Task 7) via the documented `workflow_dispatch` exception to GITHUB_TOKEN trigger suppression; (b) push to `main` — verify-or-publish rescue, which also performs the initial publish after Task 8's merge. Release tags are create-only. PR runs build+smoke only; fork PRs get a read-only token and skip publish structurally.
 
 - [ ] **Step 1: Write `.github/workflows/build.yml`**
 
@@ -431,7 +579,13 @@ name: build
 on:
   pull_request:
   push:
-    branches: [main, "bump/**", "design/**", "feat/**"]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the exact-version tag to GHCR after a green smoke test"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -443,12 +597,20 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - id: ver
         name: Read pinned Langfuse version
         run: echo "version=$(sed -n 's/^ARG LANGFUSE_VERSION=//p' image/Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against upstream start-command drift
+        run: |
+          docker pull -q "langfuse/langfuse:${{ steps.ver.outputs.version }}"
+          CMD=$(docker inspect "langfuse/langfuse:${{ steps.ver.outputs.version }}" --format '{{json .Config.Cmd}}')
+          echo "$CMD" | grep -q 'web/server.js --keepAliveTimeout 110000' \
+            || { echo "Upstream web CMD changed; update image/launcher.sh to match: $CMD"; exit 1; }
 
       - name: Build wrapper image
         run: docker build -t "$IMAGE:${{ steps.ver.outputs.version }}" image/
@@ -457,40 +619,36 @@ jobs:
         run: IMAGE_TAG="$IMAGE:${{ steps.ver.outputs.version }}" ./scripts/smoke-test.sh
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: github.repository == 'elleryfamilia/langfuse-lite-railway' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish exact-version tag (non-main branches)
-        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
-        run: docker push "$IMAGE:${{ steps.ver.outputs.version }}"
-
-      - name: Verify tag exists for main's pin
-        if: github.ref == 'refs/heads/main'
-        run: docker manifest inspect "$IMAGE:${{ steps.ver.outputs.version }}" || docker push "$IMAGE:${{ steps.ver.outputs.version }}"
+      - name: Publish exact-version tag (create-only)
+        if: github.repository == 'elleryfamilia/langfuse-lite-railway' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          if docker manifest inspect "$IMAGE:$V" >/dev/null 2>&1; then
+            echo "tag $V already exists on GHCR — leaving it untouched"
+          else
+            docker push "$IMAGE:$V"
+          fi
 ```
 
-- [ ] **Step 2: Push and watch the workflow run**
+- [ ] **Step 2: Push and open the integration PR (CI's first live run)**
 
 ```bash
 git add .github/workflows/build.yml
-git commit -m "ci: build, smoke-test, and publish wrapper image"
-git push
+git commit -m "ci: build, smoke-test, and create-only publish of the wrapper image"
+git push -u origin design/langfuse-lite-template
+gh pr create --base main --head design/langfuse-lite-template \
+  --title "feat: Langfuse Lite v1" \
+  --body "Wrapper image, service Dockerfiles, smoke harness, CI, README, design docs."
 gh run watch --exit-status "$(gh run list --branch design/langfuse-lite-template --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
-Expected: green run — build, smoke test (real end-to-end in CI), and GHCR publish of `4.6.0` (branch push → publish step runs).
-
-- [ ] **Step 3: Verify the published image is publicly pullable**
-
-Run:
-```bash
-gh api "user/packages/container/langfuse-lite" --jq .visibility
-```
-If `private` (GHCR default for first publish): make it public at https://github.com/users/elleryfamilia/packages/container/langfuse-lite/settings (Danger Zone → Change visibility → Public), then re-run the command.
-Expected: `public`, and `docker manifest inspect ghcr.io/elleryfamilia/langfuse-lite:4.6.0` succeeds from a logged-out shell (`docker logout ghcr.io` first).
+Expected: the `pull_request` run goes green (build + smoke on ubuntu; no publish on PR events). Leave the PR open — Task 7 adds one more commit to it.
 
 ---
 
@@ -500,8 +658,8 @@ Expected: `public`, and `docker manifest inspect ghcr.io/elleryfamilia/langfuse-
 - Create: `.github/workflows/bump.yml`
 
 **Interfaces:**
-- Consumes: pin lines from Tasks 2/3/4 (`ARG LANGFUSE_VERSION=` in `image/Dockerfile`; `FROM ghcr.io/elleryfamilia/langfuse-lite:` in `services/langfuse/Dockerfile`; `clickhouse-server:` tag in `services/clickhouse/Dockerfile`; `Current Langfuse version:` in `README.md`).
-- Produces: branches named `bump/langfuse-<version>` + PRs; `build.yml`'s `bump/**` push trigger builds and publishes them.
+- Consumes: pin lines from Tasks 2/3/4; `build.yml`'s `workflow_dispatch` publish path (Task 6); the repo toggle from Task 5 Step 4.
+- Produces: branches `bump/langfuse-<version>` + PRs, each with a dispatched build run (green check on the PR's head SHA) that publishes the new tag BEFORE merge. Note: the PR's own `pull_request` run will sit in "approval-required" state (GITHUB_TOKEN-created PR) — the dispatched run is the real gate; the PR body says so.
 
 - [ ] **Step 1: Write `.github/workflows/bump.yml`**
 
@@ -515,89 +673,139 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   bump:
     runs-on: ubuntu-latest
+    if: github.repository == 'elleryfamilia/langfuse-lite-railway'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - id: vers
-        name: Compare pinned vs latest upstream
+      - name: Compare pinned vs latest upstream, open gated bump PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           LATEST=$(gh api repos/langfuse/langfuse/releases/latest --jq .tag_name | sed 's/^v//')
           CURRENT=$(sed -n 's/^ARG LANGFUSE_VERSION=//p' image/Dockerfile)
-          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
-      - name: Open bump PR
-        if: steps.vers.outputs.latest != steps.vers.outputs.current
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          NEW="${{ steps.vers.outputs.latest }}"
-          git checkout -b "bump/langfuse-$NEW"
+          # Guards: non-empty, strict semver, strictly newer than current
+          echo "$LATEST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "no valid latest release ('$LATEST'); skipping"; exit 0; }
+          [ "$LATEST" = "$CURRENT" ] && { echo "already at $CURRENT"; exit 0; }
+          [ "$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -1)" = "$LATEST" ] || { echo "latest ($LATEST) is older than pin ($CURRENT); skipping"; exit 0; }
 
-          sed -i "s/^ARG LANGFUSE_VERSION=.*/ARG LANGFUSE_VERSION=$NEW/" image/Dockerfile
-          sed -i "s#^FROM ghcr.io/elleryfamilia/langfuse-lite:.*#FROM ghcr.io/elleryfamilia/langfuse-lite:$NEW#" services/langfuse/Dockerfile
-          sed -i "s/^Current Langfuse version: .*/Current Langfuse version: $NEW/" README.md
+          # Idempotency: a bump branch for this version already exists
+          git ls-remote --exit-code --heads origin "bump/langfuse-$LATEST" >/dev/null 2>&1 \
+            && { echo "bump/langfuse-$LATEST already open"; exit 0; }
 
-          # Track upstream's ClickHouse pin if it moved
-          CH=$(curl -sf "https://raw.githubusercontent.com/langfuse/langfuse/v$NEW/docker-compose.yml" \
-            | sed -n 's/.*clickhouse-server:\([0-9][0-9.]*\).*/\1/p' | head -1)
-          if [ -n "$CH" ]; then
+          git checkout -b "bump/langfuse-$LATEST"
+          sed -i "s/^ARG LANGFUSE_VERSION=.*/ARG LANGFUSE_VERSION=$LATEST/" image/Dockerfile
+          sed -i "s#^FROM ghcr.io/elleryfamilia/langfuse-lite:.*#FROM ghcr.io/elleryfamilia/langfuse-lite:$LATEST#" services/langfuse/Dockerfile
+          sed -i "s/^Current Langfuse version: .*/Current Langfuse version: $LATEST/" README.md
+
+          # Track upstream's ClickHouse pin only if the tag verifiably exists
+          CH=$(curl -sf "https://raw.githubusercontent.com/langfuse/langfuse/v$LATEST/docker-compose.yml" \
+            | sed -n 's/.*clickhouse-server:\([0-9][0-9.]*\).*/\1/p' | head -1) || CH=""
+          if [ -n "$CH" ] && docker manifest inspect "clickhouse/clickhouse-server:$CH" >/dev/null 2>&1; then
             sed -i "s#^FROM clickhouse/clickhouse-server:.*#FROM clickhouse/clickhouse-server:$CH#" services/clickhouse/Dockerfile
           fi
 
           git config user.name "langfuse-lite-bot"
           git config user.email "55049+elleryfamilia@users.noreply.github.com"
-          git commit -am "feat: bump Langfuse to $NEW"
-          git push -u origin "bump/langfuse-$NEW"
+          git commit -am "feat: bump Langfuse to $LATEST"
+          git push -u origin "bump/langfuse-$LATEST"
+
+          # GITHUB_TOKEN pushes trigger nothing; workflow_dispatch is the documented exception.
+          gh workflow run build.yml --ref "bump/langfuse-$LATEST" -f publish=true
+
           gh pr create --base main \
-            --title "feat: bump Langfuse to $NEW" \
-            --body "Automated upstream bump. The branch push triggers build.yml (build + smoke test + GHCR publish of \`$NEW\`). Merge only when green."
+            --title "feat: bump Langfuse to $LATEST" \
+            --body "Automated upstream bump. A dispatched build run on this branch builds, smoke-tests, and publishes \`$LATEST\` to GHCR — merge only when that run is green. (This PR's own pull_request check may sit in 'approval-required'; the dispatched run on the head SHA is the gate.)"
 ```
 
-- [ ] **Step 2: Push, then dry-run via workflow_dispatch**
+- [ ] **Step 2: Push to the open PR**
 
 ```bash
 git add .github/workflows/bump.yml
-git commit -m "ci: scheduled upstream release bump PRs"
+git commit -m "ci: scheduled upstream release bump PRs (dispatch-gated)"
 git push
-gh workflow run bump --ref design/langfuse-lite-template
-sleep 20
-gh run watch --exit-status "$(gh run list --workflow bump --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run watch --exit-status "$(gh run list --branch design/langfuse-lite-template --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
-Expected: green run that does NOT open a PR (pinned version already equals latest). If upstream released since 2026-08-07, a `bump/langfuse-*` PR appears instead — verify its build run goes green, then close it or merge it per its diff.
+Expected: green `pull_request` run. `bump.yml` cannot be exercised yet — `schedule`/`workflow_dispatch` only work once the file is on the default branch. Its dry run happens in Task 8 Step 4.
 
 ---
 
-### Task 8: Live test project on Railway (answers the bucket question for real infra)
+### Task 8: Merge, initial publish, bump dry-run
 
-**Files:** none (Railway MCP operations; findings recorded in Task 10's notes)
+**Files:** none
 
 **Interfaces:**
-- Consumes: public repo with `main` containing everything (merge the working branch via PR first — see Step 1); GHCR image public (Task 6).
-- Produces: a working Railway project named `langfuse-lite-test` proving the 3-service + bucket topology on real infrastructure; kept alive as the source for template conversion in Task 9.
+- Consumes: green PR from Tasks 6–7.
+- Produces: everything on `main`; `ghcr.io/elleryfamilia/langfuse-lite:4.6.0` published (amd64, from CI) and public; bump automation verified live. Railway (Task 9) can now build `services/langfuse` for real.
 
-- [ ] **Step 1: Merge working branch to main via PR**
+- [ ] **Step 1: Merge the PR**
 
 ```bash
-gh pr create --base main --head design/langfuse-lite-template --title "feat: Langfuse Lite v1" --body "Wrapper image, service Dockerfiles, CI, README, design docs. Smoke test green locally and in CI."
-gh pr merge --squash --auto "$(gh pr list --head design/langfuse-lite-template --json number --jq '.[0].number')"
+gh pr merge --squash "$(gh pr list --head design/langfuse-lite-template --json number --jq '.[0].number')"
+gh run watch --exit-status "$(gh run list --branch main --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
-Expected: PR merges once build.yml is green. Template services deploy from `main` from here on.
+Expected: the push-to-main run goes green and its create-only publish step pushes `4.6.0` (first publish — the tag doesn't exist yet).
 
-- [ ] **Step 2: Create project, bucket, and the three services (Railway MCP)**
+- [ ] **Step 2: Make the GHCR package public**
 
-Using Railway MCP tools in this order (values verbatim):
+First publish lands private. Check and fix:
+```bash
+gh api "user/packages/container/langfuse-lite" --jq .visibility
+```
+If `private`: open https://github.com/users/elleryfamilia/packages/container/langfuse-lite/settings → Danger Zone → Change visibility → Public. If the `gh api` call 403s, refresh scopes: `gh auth refresh -s read:packages`.
+Expected after fix: `public`.
+
+- [ ] **Step 3: Verify anonymous pull and the services build**
+
+```bash
+docker logout ghcr.io
+docker manifest inspect ghcr.io/elleryfamilia/langfuse-lite:4.6.0
+docker build services/langfuse/
+```
+Expected: manifest resolves without auth (amd64); the build pulls the real GHCR image (platform warning on arm64 Mac is expected).
+
+- [ ] **Step 4: Bump dry-run**
+
+```bash
+gh workflow run bump
+sleep 20
+gh run watch --exit-status "$(gh run list --workflow bump --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+Expected: green run logging `already at 4.6.0` (or, if upstream released since: a `bump/langfuse-*` PR plus a dispatched build run — watch that run go green, confirm the new tag on GHCR, then merge or close the PR deliberately).
+
+- [ ] **Step 5: Sync local**
+
+```bash
+git checkout main && git pull
+git checkout design/langfuse-lite-template && git merge main
+```
+
+---
+
+### Task 9: Live test project on Railway
+
+**Files:** none (Railway MCP operations)
+
+**Interfaces:**
+- Consumes: `main` deployable end-to-end (Task 8); Task 0's bucket outcome.
+- Produces: a working Railway project `langfuse-lite-test` proving the topology on real infrastructure; kept as the source for template conversion in Task 10.
+
+- [ ] **Step 1: Create project, bucket, and the three services (Railway MCP)**
+
+Order matters — the app's variables reference the others, and the domain must exist before `NEXTAUTH_URL` resolves:
 1. `create_project` name `langfuse-lite-test`
-2. `create_bucket` in that project/environment, name `langfuse-data`
-3. `create_service` name `Postgres`, source repo `elleryfamilia/langfuse-lite-railway`, root directory `services/postgres`; `create_volume` mount path `/var/lib/postgresql/data`; `set_variables`: `POSTGRES_USER=postgres`, `POSTGRES_DB=langfuse`, `POSTGRES_PASSWORD=<generate locally: openssl rand -hex 16>`, `PGDATA=/var/lib/postgresql/data/pgdata`
-4. `create_service` name `ClickHouse`, same repo, root directory `services/clickhouse`; `create_volume` mount path `/var/lib/clickhouse`; `set_variables`: `CLICKHOUSE_DB=default`, `CLICKHOUSE_USER=clickhouse`, `CLICKHOUSE_PASSWORD=<generate locally: openssl rand -hex 16>`
-5. `create_service` name `Langfuse`, same repo, root directory `services/langfuse`; `set_variables` (use `add_reference_variable` where the value references another service/bucket):
+2. `create_bucket` name `langfuse-data` (skip if Task 0's outcome was MINIO — instead create a MinIO service: image `cgr.dev/chainguard/minio`, volume at `/data`, start command `sh -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'`, vars `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` generated locally)
+3. `create_service` name `Postgres`, repo `elleryfamilia/langfuse-lite-railway`, root directory `services/postgres`; `create_volume` mount `/var/lib/postgresql/data`; `set_variables`:
+   `POSTGRES_USER=postgres`, `POSTGRES_DB=langfuse`, `POSTGRES_PASSWORD=<openssl rand -hex 16>`, `PGDATA=/var/lib/postgresql/data/pgdata`, `TZ=UTC`, `PGTZ=UTC`
+4. `create_service` name `ClickHouse`, same repo, root directory `services/clickhouse`; `create_volume` mount `/var/lib/clickhouse`; `set_variables`: `CLICKHOUSE_DB=default`, `CLICKHOUSE_USER=clickhouse`, `CLICKHOUSE_PASSWORD=<openssl rand -hex 16>`
+5. `create_service` name `Langfuse`, same repo, root directory `services/langfuse`; **`generate_domain` for it now**; `update_service` healthcheck path `/api/public/health` and healthcheck timeout 600 (if the MCP field isn't exposed, set variable `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600` — verify which mechanism Railway currently honors); then `set_variables` (reference syntax verified with `list_variables` afterward; `${{langfuse-data.*}}` names come from the bucket's Variable References panel):
 
 ```
 DATABASE_URL=postgresql://${{Postgres.POSTGRES_USER}}:${{Postgres.POSTGRES_PASSWORD}}@${{Postgres.RAILWAY_PRIVATE_DOMAIN}}:5432/${{Postgres.POSTGRES_DB}}
@@ -612,7 +820,6 @@ NEXTAUTH_SECRET=<openssl rand -hex 32>
 SALT=<openssl rand -hex 32>
 ENCRYPTION_KEY=<openssl rand -hex 32>   # yields 64 hex chars — required length
 PORT=3000
-HOSTNAME=::
 LANGFUSE_S3_EVENT_UPLOAD_BUCKET=${{langfuse-data.BUCKET}}
 LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=${{langfuse-data.ENDPOINT}}
 LANGFUSE_S3_EVENT_UPLOAD_REGION=${{langfuse-data.REGION}}
@@ -635,84 +842,84 @@ LANGFUSE_INIT_USER_EMAIL=ellery@familia.me
 LANGFUSE_INIT_USER_NAME=Ellery
 LANGFUSE_INIT_USER_PASSWORD=<openssl rand -hex 12>
 ```
-6. `generate_domain` for the Langfuse service; set healthcheck path `/api/public/health` via `update_service`.
+(No `HOSTNAME` variable — the launcher owns the `::` binding. MinIO fallback: swap the five `${{langfuse-data.*}}` groups for `http://${{MinIO.RAILWAY_PRIVATE_DOMAIN}}:9000`, bucket `langfuse`, MinIO's root creds, `FORCE_PATH_STYLE=true`.)
 
-Adjust exact reference syntax to what the MCP tools accept (verify with `list_variables` after setting; the `${{Bucket.*}}` names come from the bucket's Variable References panel).
+- [ ] **Step 2: Deploy and verify on real infrastructure**
 
-- [ ] **Step 3: Deploy and verify on real infrastructure**
+- Trigger deploys if not automatic; poll `list_deployments` / `environment_status` until all services are `SUCCESS`.
+- `get_logs` on Langfuse: expect "postgres reachable", "clickhouse reachable", migrations, then worker start after health.
+- From local shell against `https://<generated-domain>`: health 200 → ingest a trace with the INIT keys → poll `/api/public/traces/<id>` until 200 (reuse Task 1's curl commands with the domain substituted).
+Expected: trace queryable — proves the Railway bucket works as Langfuse's S3.
 
-- Trigger deploys (`deploy` tool per service if not automatic), then poll `list_deployments` / `environment_status` until all three are `SUCCESS`.
-- `get_logs` on Langfuse: confirm migrations ran, worker started after health, no S3 errors.
-- From local shell, run the cloud equivalent of the smoke assertions against `https://<generated-domain>`: health 200 → ingest a trace with the INIT keys → poll `/api/public/traces/<id>` until 200. Reuse the curl commands from Task 1 with the domain substituted.
-Expected: trace queryable — proves the Railway bucket works as Langfuse's S3 (the design's main empirical question for runtime).
+- [ ] **Step 3: Remove INIT bootstrap variables**
 
-- [ ] **Step 4: Remove INIT bootstrap variables**
-
-Delete all `LANGFUSE_INIT_*` variables from the Langfuse service (`set_variables` with removal or dashboard) and redeploy. These must NOT leak into the template.
+Delete ALL `LANGFUSE_INIT_*` variables from the Langfuse service and redeploy. These carry real PII (your email) and must never reach the template.
 Verify: `list_variables` shows no `LANGFUSE_INIT_*`.
 
 ---
 
-### Task 9: Compose and publish the template
+### Task 10: Compose and publish the template
 
 **Files:** none (Railway dashboard; browser)
 
 **Interfaces:**
-- Consumes: proven test project (Task 8); README overview copy (Task 4).
+- Consumes: proven test project (Task 9); README overview copy (Task 4); Task 0's bucket outcome.
 - Produces: published marketplace template "Langfuse Lite".
 
-- [ ] **Step 1: Convert or compose**
+- [ ] **Step 1: Convert the project**
 
-In the Railway dashboard (user drives, or claude-in-chrome with the user watching): from `langfuse-lite-test` project → Settings → **Generate Template from Project**. In the composer, verify what carried over — **this empirically answers whether buckets can ship in templates.**
-- If the bucket carried into the composer: proceed.
-- If NOT (fallback, per approved design): remove bucket references; add a 4th service `MinIO` — image `cgr.dev/chainguard/minio`, volume at `/data`, start command `sh -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'`, variables `MINIO_ROOT_USER=${{secret()}}`, `MINIO_ROOT_PASSWORD=${{secret()}}`; rewire the app's `LANGFUSE_S3_*` variables to `http://${{MinIO.RAILWAY_PRIVATE_DOMAIN}}:9000`, bucket `langfuse`, `FORCE_PATH_STYLE=true`, keys referencing MinIO's variables.
+Railway dashboard (user drives, or claude-in-chrome with the user watching): `langfuse-lite-test` → Settings → **Generate Template from Project**. Confirm in the composer: three services sourced from the GitHub repo with root directories `services/langfuse`, `services/clickhouse`, `services/postgres` (NOT images); volumes on Postgres and ClickHouse; healthcheck + public networking (HTTP) on the app service — without a declared domain, deployers get an empty `RAILWAY_PUBLIC_DOMAIN` and broken auth callbacks. Apply Task 0's outcome for storage (bucket carried over, or MinIO service per Task 9's fallback wiring).
 
-- [ ] **Step 2: Replace concrete secrets with template variable functions**
+- [ ] **Step 2: Secret audit — deny by default**
 
-In the composer, for every variable that came over with a concrete test value:
-- `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `NEXTAUTH_SECRET`, `SALT` → `${{secret()}}`
-- `ENCRYPTION_KEY` → `${{secret(64, "abcdef0123456789")}}`
-- Confirm NO `LANGFUSE_INIT_*` variables exist anywhere.
-- Confirm reference variables (`DATABASE_URL`, `CLICKHOUSE_*`, `LANGFUSE_S3_*`, `NEXTAUTH_URL`) survived conversion; re-add per Task 8 Step 2 if not.
-- Service sources must show the GitHub repo + root directories (not images); healthcheck `/api/public/health` on the app; volumes present on Postgres (`/var/lib/postgresql/data`) and ClickHouse (`/var/lib/clickhouse`).
+Enumerate EVERY variable on EVERY service in the composer. Each must be one of:
+1. a `${{...}}` reference or template function, or
+2. an explicitly-reviewed non-secret literal (e.g., `PORT=3000`, `CLICKHOUSE_DB=default`, `TZ=UTC`).
+
+Convert generated values: `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `NEXTAUTH_SECRET`, `SALT` → `${{secret()}}`; `ENCRYPTION_KEY` → `${{secret(64, "abcdef0123456789")}}`. Confirm zero `LANGFUSE_INIT_*` anywhere, zero literal bucket/MinIO credentials, zero personal data. Anything unexplained blocks publish. Write the pass/fail list down before proceeding.
 
 - [ ] **Step 3: Metadata and publish**
 
-- Template name: `Langfuse Lite` (no version in the name — the README/overview carries the version line).
-- Icons: Langfuse logo for the app service (1:1, transparent), official Postgres/ClickHouse logos for theirs.
-- Overview: paste README content (already in Railway's required format).
-- Publish to marketplace (workspace: Ellery's personal — honest non-affiliation, stated in overview).
+- Name: `Langfuse Lite` (no version — the overview's version line is bump-maintained).
+- Icons: Langfuse logo (1:1, transparent) for the app; official Postgres/ClickHouse logos for theirs.
+- Overview: paste README content.
+- Publish under Ellery's personal workspace (honest non-affiliation, stated in the overview).
 
 - [ ] **Step 4: Final end-to-end — deploy the published template fresh**
 
-Deploy the published template into a brand-new project (one click, zero variable entry expected). Wait for all services green. Create an account in the UI, create a project, create an API key, send one trace (curl as in Task 1), see it in the UI.
-Expected: complete cold-start success with no manual variables. This is the release gate.
+Deploy the published template into a brand-new project. Expected: zero variable prompts, all services green within the healthcheck window, and: create account in UI → create API key → curl one trace in → see it in the UI. This is the release gate.
 
 - [ ] **Step 5: Teardown test resources**
 
-Ask the user before deleting anything. Then remove `langfuse-lite-test` and the final-E2E project (dashboard or MCP `remove_service`/project deletion), keeping the published template.
+Ask the user before deleting anything. Then remove `langfuse-lite-test` and the final-E2E project, keeping the published template.
 
 ---
 
-### Task 10: Record findings and finish the branch
+### Task 11: Record findings and finish
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-08-07-langfuse-lite-railway-template-design.md` (Risks section — record the empirical bucket answer)
-- Modify: `README.md` (add the published template's marketplace URL badge/link at the top)
+- Modify: `docs/superpowers/specs/2026-08-07-langfuse-lite-railway-template-design.md` (Risks — final bucket answer; reconcile any drift)
+- Modify: `README.md` (add the marketplace deploy link)
 
 **Interfaces:**
-- Consumes: outcomes of Tasks 8–9.
+- Consumes: outcomes of Tasks 9–10.
 - Produces: final state; branch integration via superpowers:finishing-a-development-branch.
 
-- [ ] **Step 1: Update spec Risks + README with the bucket outcome and template URL**
+- [ ] **Step 1: Fresh branch from main**
 
-Edit the spec's risk table row "Buckets can't be included in published templates" to state what was actually observed. Add to README top: `**Deploy:** https://railway.com/deploy/<template-code>`.
+The feature branch was squash-merged in Task 8 — never reuse it. Start clean:
+```bash
+git checkout main && git pull && git checkout -b docs/publish-outcome
+```
 
-- [ ] **Step 2: Commit and integrate**
+- [ ] **Step 2: Update docs, PR, integrate**
 
+Record the empirical bucket outcome in the spec's Risks table; add `**Deploy:** https://railway.com/deploy/<template-code>` to the top of README.
 ```bash
 git add -A && git commit -m "docs: record template publish outcome and deploy link"
-git push
-gh pr create --base main --title "docs: publish outcome" --body "Records bucket finding and adds marketplace link."
+git push -u origin docs/publish-outcome
+gh pr create --base main --title "docs: publish outcome" --body "Records bucket finding and adds marketplace deploy link."
+gh run watch --exit-status "$(gh run list --branch docs/publish-outcome --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh pr merge --squash "$(gh pr list --head docs/publish-outcome --json number --jq '.[0].number')"
 ```
-Then use superpowers:finishing-a-development-branch for final integration.
+Then use superpowers:finishing-a-development-branch for any remaining cleanup.

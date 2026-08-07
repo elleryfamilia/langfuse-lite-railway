@@ -81,7 +81,12 @@ projects) where cost matters more than high availability.
   death.
 - No volume. Redis queue/cache is deliberately ephemeral; a redeploy may drop
   queued-but-unprocessed events. Documented as an accepted pre-prod trade-off.
-- Default resources sized for ~1.5–2 GB RAM.
+- The worker runs on internal port 3030 (it binds `env.PORT`, so the launcher
+  must export `PORT=3030` in its subshell or it collides with web on 3000);
+  web binds `::` (IPv6 dual-stack) via a launcher export, which Railway's
+  IPv6-only private networking requires.
+- Railway templates cannot pin service resources; the README documents a
+  ~2 GB RAM guideline for the app service instead.
 
 ### Service 2: `Postgres`
 
@@ -148,8 +153,8 @@ optional variables, never required ones.
 ```
 langfuse-lite-railway/
 ├── image/
-│   ├── Dockerfile          # the real image: worker + redis + supervisor into web image
-│   └── supervisor/         # supervisor config + entrypoint script
+│   ├── Dockerfile          # the real image: worker + redis + launcher into web image
+│   └── launcher.sh         # bash launcher: readiness waits, redis, web, health-gated worker
 ├── services/               # what the template's services actually deploy
 │   ├── langfuse/Dockerfile   # FROM ghcr.io/elleryfamilia/langfuse-lite:4.6.0
 │   ├── clickhouse/Dockerfile # FROM clickhouse/clickhouse-server:25.12

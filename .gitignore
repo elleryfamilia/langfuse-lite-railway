@@ -1,0 +1,6 @@
+.loadout/generated/
+.loadout/cache/
+.loadout/logs/
+.loadout/local.toml
+.cursor/rules/loadout.mdc
+.cursor/skills/loadout/

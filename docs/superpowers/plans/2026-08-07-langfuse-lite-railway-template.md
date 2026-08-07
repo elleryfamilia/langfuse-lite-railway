@@ -388,10 +388,10 @@ FROM ghcr.io/elleryfamilia/langfuse-lite:4.6.0
 `services/clickhouse/Dockerfile`:
 ```dockerfile
 FROM clickhouse/clickhouse-server:25.12
-COPY lockdown.xml /etc/clickhouse-server/users.d/lockdown.xml
+COPY lockdown.xml /etc/clickhouse-server/users.d/00-lockdown.xml
 ```
 
-`services/clickhouse/lockdown.xml` — the official entrypoint creates `CLICKHOUSE_USER` but leaves the passwordless `default` user reachable; restrict it to loopback so it cannot be used across Railway's private network:
+`services/clickhouse/lockdown.xml` — **corrected threat model (verified 2026-08-07 on clickhouse-server:25.12):** the entrypoint does NOT leave `default` passwordless. Whenever `CLICKHOUSE_USER` is set (which this template always does), it writes its own `users.d/default-user.xml` containing `<default remove="remove">`, deleting the user outright. The entrypoint is therefore the primary protection and this file is defense-in-depth. Two consequences: (1) the file must land at `users.d/00-lockdown.xml` — `users.d` merges alphabetically, and the unprefixed name sorted *after* `default-user.xml`, re-creating a stub `default` with `<networks>` and no password directive, which ClickHouse rejects with `CANNOT_LOAD_CONFIG`, crash-looping on first boot; (2) **Task 7 implication** — since upstream's entrypoint carries the real protection, re-verify `default` is unreachable after any ClickHouse version bump. Content restricts `default` to loopback if it exists at all:
 ```xml
 <clickhouse>
   <users>

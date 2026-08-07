@@ -21,8 +21,12 @@ this plan wherever they conflict:
   header `x-langfuse-ingestion-version: 4`, basic auth `pk:sk`, OTLP/JSON body.
   Verified present in the image at
   `/app/web/.next/server/pages/api/public/otel/v1/traces.js`.
-- The OTLP trace id (32 hex chars) is the id to poll on
-  `GET /api/public/traces/<id>`.
+- Read-side consequence (verified 2026-08-07): `GET /api/public/traces/<id>`
+  returns **404 in events_only mode** — the app's own message directs callers
+  to `GET /api/public/v2/observations?fromStartTime=…&toStartTime=…`. The smoke
+  test asserts on that endpoint, matching its own generated trace id inside
+  `data[]` (an empty list or a foreign observation must fail). This is a
+  property of Langfuse v4, not a choice this template makes.
 - `image/Dockerfile` carries **no** `LANGFUSE_MIGRATION_V4_*` ENV lines.
 - README states the minimum SDK versions.
 

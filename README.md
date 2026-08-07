@@ -21,6 +21,12 @@ Railway bucket. Upgrades ship as pull requests in this repo — merging a
 version bump updates new deploys and notifies existing ones via Railway's
 template update flow.
 
+**This template runs Langfuse's v4-native ingestion path (`events_only` write
+mode).** Instrument with Python SDK ≥4.7.0, JS SDK ≥5.4.0, or native
+OpenTelemetry. Older SDKs that use the legacy batch ingestion endpoint are
+rejected — the API returns a per-event "Event type not accepted" error — so
+their traces never appear.
+
 **After deploying: open the app URL and create your account immediately.**
 Sign-up is open on a fresh instance — the first person to register owns it.
 

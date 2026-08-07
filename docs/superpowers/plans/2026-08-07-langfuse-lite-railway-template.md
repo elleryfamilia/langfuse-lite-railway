@@ -23,7 +23,21 @@
 
 ---
 
-### Task 0: Bucket-in-template spike (10 minutes, answers the fork in the road)
+### Task 0: Bucket-in-template spike — ✅ DONE 2026-08-07. **Outcome: BUCKET.**
+
+> Verified in the template composer: `Add New → Bucket` adds a "Railway Provided"
+> bucket ("No config required") whose Credentials tab exposes Endpoint URL,
+> Region, Bucket Name, Access Key ID, Secret Access Key — each with a "Copy
+> Reference" button, each "Populated after deploy". **The MinIO fallback is not
+> needed anywhere in this plan; ignore every MinIO-fallback branch below except
+> in `compose.smoke.yml`, where MinIO remains the local S3 stand-in.** README
+> copy stays "3 services + a storage bucket".
+>
+> Cleanup note: the throwaway draft template is named `swift-warm` in Ellery's
+> workspace. Deleting it requires a 2FA code, so it was left in place — Ellery
+> deletes it (do NOT touch `high-vast`, which is pre-existing and unrelated).
+
+<details><summary>Original spike steps (completed)</summary>
 
 **Files:** none (Railway dashboard)
 
@@ -44,6 +58,8 @@ Update the spec's Risks table row ("Buckets can't be included in published templ
 ```bash
 git add -A && git commit -m "docs: record bucket-in-template spike outcome"
 ```
+
+</details>
 
 ---
 

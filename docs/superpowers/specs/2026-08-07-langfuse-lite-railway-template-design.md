@@ -109,7 +109,7 @@ projects) where cost matters more than high availability.
   Keeper/ZooKeeper.
 - Volume at `/var/lib/clickhouse`. User/password via `${{secret()}}`.
 
-### Storage: Railway Bucket (or MinIO fallback)
+### Storage: Railway Bucket (confirmed supported in templates, 2026-08-07)
 
 - Bucket credentials (`BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`,
   `ENDPOINT`, `REGION`) wired to the app via reference variables.
@@ -240,7 +240,7 @@ for the project; template-composer publishing is the one manual step.
 
 | Risk | Mitigation |
 |---|---|
-| Buckets can't be included in published templates | Decided fallback: MinIO 4th service, same env contract; swap later |
+| ~~Buckets can't be included in published templates~~ **RESOLVED 2026-08-07: they can.** | Verified empirically in the template composer: `Add New → Bucket` adds a "Railway Provided" bucket node needing no config, whose Credentials tab exposes Endpoint URL, Region, Bucket Name, Access Key ID, and Secret Access Key — each with a "Copy Reference" button and each "Populated after deploy", so every deployer gets their own bucket and credentials with no literal secrets in the template. MinIO fallback not needed. |
 | Upstream image restructure breaks the wrapper | CI smoke test on every bump PR; failed bump never publishes |
 | Combined container OOMs on default resources | Size defaults ~2 GB; document minimums in README |
 | Queue loss on redeploy (ephemeral Redis) | Documented, accepted for pre-prod; events already in S3 are re-processable |

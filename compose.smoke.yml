@@ -41,7 +41,7 @@ services:
       LANGFUSE_INIT_USER_NAME: Smoke
       LANGFUSE_INIT_USER_PASSWORD: smokePassw0rd!
   postgres:
-    image: ghcr.io/railwayapp-templates/postgres-ssl:17
+    build: ./services/postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -57,7 +57,7 @@ services:
       timeout: 3s
       retries: 30
   clickhouse:
-    image: clickhouse/clickhouse-server:25.12
+    build: ./services/clickhouse
     environment:
       CLICKHOUSE_DB: default
       CLICKHOUSE_USER: clickhouse

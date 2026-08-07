@@ -69,12 +69,16 @@ projects) where cost matters more than high availability.
     image via multi-stage build. Async event processing.
   - **Redis** — Redis 7 (upstream compose parity), installed in-image, bound
     to localhost only.
-- Supervisor: decision rule — if the upstream base image's package manager
-  provides `supervisord`, use it (it handles signal forwarding and
-  exit-on-child-death declaratively); otherwise a shell entrypoint under
-  `tini` that starts all three processes and exits nonzero when any child
-  exits. Either way the requirements are: forward SIGTERM to children, and
-  container death on any process death so Railway restarts it.
+- Supervisor: a bash launcher script under the image's existing `dumb-init`
+  PID1: start Redis, start web (upstream entrypoint runs migrations then
+  serves), start the worker gated on web health (`wget --spider` loop against
+  `/api/public/health` so it never races unfinished migrations), then
+  `wait -n` — when any process exits, kill the rest and exit with its code so
+  Railway restarts the container. supervisord was considered and rejected: it
+  does not exit when a child dies without an event-listener workaround, which
+  is more machinery than the bash script it would replace. Requirements
+  either way: forward SIGTERM to children; container death on any process
+  death.
 - No volume. Redis queue/cache is deliberately ephemeral; a redeploy may drop
   queued-but-unprocessed events. Documented as an accepted pre-prod trade-off.
 - Default resources sized for ~1.5–2 GB RAM.
@@ -147,7 +151,7 @@ langfuse-lite-railway/
 │   ├── Dockerfile          # the real image: worker + redis + supervisor into web image
 │   └── supervisor/         # supervisor config + entrypoint script
 ├── services/               # what the template's services actually deploy
-│   ├── langfuse/Dockerfile   # FROM ghcr.io/elleryfamilia/langfuse-lite:v4.6.0
+│   ├── langfuse/Dockerfile   # FROM ghcr.io/elleryfamilia/langfuse-lite:4.6.0
 │   ├── clickhouse/Dockerfile # FROM clickhouse/clickhouse-server:25.12
 │   └── postgres/Dockerfile   # FROM ghcr.io/railwayapp-templates/postgres-ssl:17
 ├── compose.smoke.yml       # local/CI stack: app image, postgres, clickhouse, minio
@@ -168,7 +172,8 @@ pull).
 
 Single source of truth for the pinned version: `ARG LANGFUSE_VERSION` in
 `image/Dockerfile`; the bump PR keeps `services/langfuse/Dockerfile` in sync.
-GHCR tags mirror upstream tags exactly.
+GHCR tags mirror upstream **Docker Hub** tags exactly (`4.6.0`, no `v`
+prefix — upstream GitHub releases use `v4.6.0` but their image tags do not).
 
 ## CI
 

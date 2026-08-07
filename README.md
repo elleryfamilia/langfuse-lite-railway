@@ -1,5 +1,9 @@
 # Deploy and Host Langfuse Lite on Railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/langfuse-lite)
+
+**Live on the Railway marketplace:** https://railway.com/deploy/langfuse-lite
+
 Langfuse is an open-source LLM engineering platform: tracing, evals, prompt
 management, and metrics. **Langfuse Lite** deploys it in just 3 services + a
 storage bucket — about half the footprint of a full production topology —

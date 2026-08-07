@@ -1,5 +1,11 @@
 # Railway template composer — exact values
 
+> **Status: published.** The template is live at
+> https://railway.com/deploy/langfuse-lite and all values below are already
+> entered. Keep this document as the reference for what the template contains
+> and for rebuilding it from scratch if it is ever regenerated from a project
+> (regeneration strips literal values again).
+
 The Railway template is generated from the working `langfuse-lite-test` project.
 The generator **strips every literal variable value** (references like
 `${{Postgres.POSTGRES_PASSWORD}}` survive; plain values do not), so each service's

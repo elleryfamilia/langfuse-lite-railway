@@ -11,6 +11,10 @@ cleanup() { "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 if [ -n "${IMAGE_TAG:-}" ]; then
+  # app is pre-built by the caller and referenced via IMAGE_TAG; postgres and
+  # clickhouse still need a local build since they have no cached image on a
+  # fresh runner. --no-build then reuses IMAGE_TAG for app instead of rebuilding it.
+  "${COMPOSE[@]}" build postgres clickhouse
   "${COMPOSE[@]}" up -d --no-build
 else
   "${COMPOSE[@]}" up -d --build

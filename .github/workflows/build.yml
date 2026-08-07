@@ -1,0 +1,63 @@
+name: build
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the exact-version tag to GHCR after a green smoke test"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  IMAGE: ghcr.io/elleryfamilia/langfuse-lite
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: ver
+        name: Read pinned Langfuse version
+        run: echo "version=$(sed -n 's/^ARG LANGFUSE_VERSION=//p' image/Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against upstream start-command drift
+        run: |
+          docker pull -q "langfuse/langfuse:${{ steps.ver.outputs.version }}"
+          CMD=$(docker inspect "langfuse/langfuse:${{ steps.ver.outputs.version }}" --format '{{json .Config.Cmd}}')
+          echo "$CMD" | grep -q 'web/server.js --keepAliveTimeout 110000' \
+            || { echo "Upstream web CMD changed; update image/launcher.sh to match: $CMD"; exit 1; }
+
+      - name: Build wrapper image
+        run: docker build -t "$IMAGE:${{ steps.ver.outputs.version }}" image/
+
+      - name: Smoke test the built image
+        run: IMAGE_TAG="$IMAGE:${{ steps.ver.outputs.version }}" ./scripts/smoke-test.sh
+
+      - name: Log in to GHCR
+        if: github.repository == 'elleryfamilia/langfuse-lite-railway' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish exact-version tag (create-only)
+        if: github.repository == 'elleryfamilia/langfuse-lite-railway' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          if docker manifest inspect "$IMAGE:$V" >/dev/null 2>&1; then
+            echo "tag $V already exists on GHCR — leaving it untouched"
+          else
+            docker push "$IMAGE:$V"
+          fi

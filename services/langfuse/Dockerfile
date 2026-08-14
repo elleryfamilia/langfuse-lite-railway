@@ -1,1 +1,1 @@
-FROM ghcr.io/elleryfamilia/langfuse-lite:4.6.0
+FROM ghcr.io/elleryfamilia/langfuse-lite:4.11.0

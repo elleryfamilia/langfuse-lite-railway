@@ -1,4 +1,4 @@
-ARG LANGFUSE_VERSION=4.6.0
+ARG LANGFUSE_VERSION=4.43.0
 FROM langfuse/langfuse-worker:${LANGFUSE_VERSION} AS worker
 
 FROM langfuse/langfuse:${LANGFUSE_VERSION}

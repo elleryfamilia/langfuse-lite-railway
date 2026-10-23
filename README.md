@@ -11,7 +11,7 @@ for pre-production environments where cost matters more than high
 availability. This is an unofficial community template, not affiliated with
 Langfuse GmbH.
 
-Current Langfuse version: 4.6.0
+Current Langfuse version: 4.69.0
 
 ## About Hosting Langfuse Lite
 

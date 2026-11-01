@@ -11,7 +11,7 @@ for pre-production environments where cost matters more than high
 availability. This is an unofficial community template, not affiliated with
 Langfuse GmbH.
 
-Current Langfuse version: 4.6.0
+Current Langfuse version: 4.72.0
 
 ## About Hosting Langfuse Lite
 
@@ -49,7 +49,8 @@ Sign-up is open on a fresh instance — the first person to register owns it.
   `events_only` write mode
 - PostgreSQL (Railway postgres-ssl; pinned in `services/postgres/Dockerfile`)
 - ClickHouse single node (pinned in `services/clickhouse/Dockerfile`)
-- Redis (embedded, ephemeral)
+- Redis (embedded, ephemeral; binary copied from `redis:8.2-bookworm` because
+  Langfuse's ubi9-micro base image ships no package manager)
 - Railway bucket (S3-compatible)
 
 ### Deployment Dependencies
@@ -79,8 +80,8 @@ your pre-production apps at the lowest service footprint available.
 ## Development
 
 - `./scripts/smoke-test.sh` — full local end-to-end: builds the wrapper
-  image, boots Postgres + ClickHouse + MinIO, ingests a trace, and verifies
-  it becomes queryable.
+  image, boots Postgres + ClickHouse + an S3 stand-in (VersityGW), ingests a
+  trace, and verifies it becomes queryable.
 - A scheduled GitHub Action watches Langfuse releases and opens bump PRs;
   CI builds, smoke-tests, and publishes the exact-version image before the
   PR can merge. Merging is the release action.

@@ -15,7 +15,7 @@ jobs:
     if: github.repository == 'elleryfamilia/langfuse-lite-railway'
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compare pinned vs latest upstream, open gated bump PR
         env:
@@ -67,3 +67,17 @@ jobs:
           gh pr create --base main \
             --title "feat: bump Langfuse to $LATEST" \
             --body "Automated upstream bump. A dispatched build run on this branch builds, smoke-tests, and publishes \`$LATEST\` to GHCR — merge only when that run is green. (This PR's own pull_request check may sit in 'approval-required'; the dispatched run on the head SHA is the gate.)"
+
+          # Supersede older bumps. Each open `bump/langfuse-*` PR targets a version
+          # this one replaces, so none of them can ever be the PR that gets merged.
+          # Without this the workflow leaves one dead PR per release: 52 had piled
+          # up by 2026-11-01, and the pile-up is what hid the fact that every one
+          # of their builds was failing.
+          NEW_PR=$(gh pr view "bump/langfuse-$LATEST" --json number --jq .number)
+          gh pr list --state open --limit 200 --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bump/langfuse-\")) | select(.headRefName != \"bump/langfuse-$LATEST\") | .number" \
+            | while read -r n; do
+                echo "closing superseded bump PR #$n"
+                gh pr close "$n" --delete-branch \
+                  --comment "Superseded by #$NEW_PR, which bumps to $LATEST." || true
+              done

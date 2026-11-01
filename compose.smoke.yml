@@ -5,7 +5,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
-      minio: { condition: service_started }
+      s3: { condition: service_started }
     ports: ["3000:3000"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/langfuse
@@ -24,14 +24,14 @@ services:
       LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
       LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
       LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://s3:9000
       LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
       LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
       LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
       LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
       LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
       LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://s3:9000
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
       LANGFUSE_INIT_ORG_ID: smoke-org
       LANGFUSE_INIT_PROJECT_ID: smoke-project
@@ -67,11 +67,16 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    entrypoint: sh -c 'mkdir -p /data/langfuse && minio server /data'
-    environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: miniosecret
+  s3:
+    # MinIO's community images were pulled from Docker Hub and Quay, so the
+    # harness needs a maintained S3 stand-in. VersityGW's posix backend treats
+    # every subdirectory of its root as a bucket, which keeps the "make the
+    # bucket by making a directory" trick the MinIO service used. Region is
+    # "auto" to match what a Railway bucket reports.
+    image: versity/versitygw:v1.10.0
+    entrypoint: sh -c 'mkdir -p /data/langfuse && exec versitygw --access minio --secret miniosecret --region auto --port :9000 posix /data'
+    volumes:
+      - s3data:/data
 volumes:
   pgdata:
+  s3data:

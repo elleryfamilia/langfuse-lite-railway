@@ -25,18 +25,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: ver
         name: Read pinned Langfuse version
         run: echo "version=$(sed -n 's/^ARG LANGFUSE_VERSION=//p' image/Dockerfile)" >> "$GITHUB_OUTPUT"
 
-      - name: Guard against upstream start-command drift
+      - name: Guard against upstream layout drift
         run: |
-          docker pull -q "langfuse/langfuse:${{ steps.ver.outputs.version }}"
-          CMD=$(docker inspect "langfuse/langfuse:${{ steps.ver.outputs.version }}" --format '{{json .Config.Cmd}}')
+          V="${{ steps.ver.outputs.version }}"
+          docker pull -q "langfuse/langfuse:$V"
+          docker pull -q "langfuse/langfuse-worker:$V"
+          CMD=$(docker inspect "langfuse/langfuse:$V" --format '{{json .Config.Cmd}}')
           echo "$CMD" | grep -q 'web/server.js --keepAliveTimeout 110000' \
             || { echo "Upstream web CMD changed; update image/launcher.sh to match: $CMD"; exit 1; }
+          # The wrapper hard-depends on bash, both entrypoints, and /app/worker.
+          # Langfuse 4.72 rebased onto ubi9-micro, which silently dropped the
+          # package manager and would have failed the build much later with an
+          # opaque `apk: command not found`. Assert the assumptions here so a
+          # base-image change names itself.
+          docker run --rm --entrypoint /bin/sh "langfuse/langfuse:$V" -c \
+            'command -v bash >/dev/null && test -x /app/web/entrypoint.sh' \
+            || { echo "Upstream web image lost bash or /app/web/entrypoint.sh; update image/Dockerfile and image/launcher.sh"; exit 1; }
+          docker run --rm --entrypoint /bin/sh "langfuse/langfuse-worker:$V" -c \
+            'test -x /app/worker/entrypoint.sh' \
+            || { echo "Upstream worker image lost /app/worker/entrypoint.sh; update image/launcher.sh"; exit 1; }
 
       - name: Build wrapper image
         run: docker build -t "$IMAGE:${{ steps.ver.outputs.version }}" image/
@@ -46,7 +59,7 @@ jobs:
 
       - name: Log in to GHCR
         if: github.repository == 'elleryfamilia/langfuse-lite-railway' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

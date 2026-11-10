@@ -1,4 +1,4 @@
-FROM clickhouse/clickhouse-server:25.12
+FROM clickhouse/clickhouse-server:26.3.62.3
 # Destination filename is prefixed "00-" so it sorts alphabetically before the
 # entrypoint-generated users.d/default-user.xml. That file does
 # `<default remove="remove">` whenever CLICKHOUSE_USER is set, then defines a

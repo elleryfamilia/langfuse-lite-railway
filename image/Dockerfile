@@ -1,4 +1,4 @@
-ARG LANGFUSE_VERSION=4.72.0
+ARG LANGFUSE_VERSION=4.79.0
 
 # Redis is not in the upstream image, and Langfuse 4.72's base image cannot
 # install it: upstream rebased onto ubi9-micro, which ships no package manager
